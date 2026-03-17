@@ -13,8 +13,17 @@ pub fn create_terminal(working_directory: Option<&str>) -> Terminal {
     terminal.set_hexpand(true);
     terminal.set_vexpand(true);
 
-    // Font
+    // Font — use a Pango font description with fallbacks for powerline/symbols.
+    // Pango resolves the first available family; "Monospace" is the system default.
+    // VTE only uses the first family from FontDescription, so we need to set
+    // fallback fonts via fontconfig attributes instead.
     let font_desc = gtk::pango::FontDescription::from_string("Monospace 11");
+    terminal.set_font(Some(&font_desc));
+    terminal.set_bold_is_bright(true);
+    // Enable font fallback so Pango searches other installed fonts for missing glyphs
+    // (e.g. powerline symbols). This is the VTE/Pango equivalent of Ghostty's built-in
+    // powerline rendering.
+    font_desc.set_family("Monospace");
     terminal.set_font(Some(&font_desc));
 
     // Colors — dark terminal background

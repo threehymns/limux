@@ -22,12 +22,16 @@ struct Workspace {
     sidebar_row: gtk::ListBoxRow,
     /// Name label in sidebar row.
     name_label: gtk::Label,
+    /// Favorite star button in sidebar row.
+    favorite_button: gtk::Button,
     /// Notification dot in the sidebar row.
     notify_dot: gtk::Label,
     /// Notification message label in the sidebar row.
     notify_label: gtk::Label,
     /// Whether this workspace has unread notifications.
     unread: bool,
+    /// Whether this workspace is favorited/pinned to top.
+    favorite: bool,
 }
 
 struct AppState {
@@ -66,6 +70,28 @@ const CSS: &str = r#"
 }
 row:selected .cmux-ws-name {
     color: white;
+}
+.cmux-ws-star-btn {
+    color: rgba(255, 255, 255, 0.45);
+    border: none;
+    min-height: 0;
+    min-width: 0;
+    padding: 0;
+    font-size: 16px;
+}
+.cmux-ws-star-btn:hover {
+    color: rgba(255, 255, 255, 0.9);
+}
+row:selected .cmux-ws-star-btn {
+    color: rgba(255, 255, 255, 0.85);
+}
+.cmux-ws-star-btn-active {
+    color: #f7c948;
+}
+.cmux-ws-rename-entry {
+    min-height: 0;
+    padding: 0 4px;
+    margin: 0;
 }
 .cmux-notify-dot {
     color: #0091FF;
@@ -218,6 +244,17 @@ pub fn build_window(app: &adw::Application) {
     register_actions(&window, &state);
     install_key_capture(&window, &state);
 
+    // Any click anywhere in the window commits an active sidebar rename
+    {
+        let sl = sidebar_list.clone();
+        let click_anywhere = gtk::GestureClick::new();
+        click_anywhere.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click_anywhere.connect_pressed(move |_, _, _, _| {
+            commit_any_active_rename(&sl);
+        });
+        window.add_controller(click_anywhere);
+    }
+
     {
         let state = state.clone();
         sidebar_list.connect_row_selected(move |_, row| {
@@ -273,6 +310,7 @@ fn register_actions(window: &adw::ApplicationWindow, state: &State) {
 /// Intercept keyboard shortcuts in the CAPTURE phase so VTE doesn't eat them.
 fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
     use gtk::gdk;
+    use vte4::TerminalExt;
 
     let key_controller = gtk::EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -282,7 +320,25 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
         let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
 
-        // Strip lock keys (CapsLock, NumLock) from comparison
+        // Shift+Enter → feed kitty keyboard protocol sequence to VTE.
+        // VTE doesn't distinguish Shift+Enter from Enter by default,
+        // but apps like Claude Code and Codex need \x1b[13;2u for "newline without submit".
+        if !ctrl && shift && keyval == gdk::Key::Return {
+            // Find the focused VTE terminal and feed the escape sequence
+            let stack = state.borrow().stack.clone();
+            if let Some(root) = stack.root() {
+                if let Ok(window) = root.downcast::<gtk::Window>() {
+                    if let Some(focus) = gtk::prelude::GtkWindowExt::focus(&window) {
+                        if let Some(term) = focus.downcast_ref::<vte4::Terminal>() {
+                            // CSI 13;2u = kitty protocol for Shift+Enter
+                            term.feed_child(b"\x1b[13;2u");
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                }
+            }
+        }
+
         let matched = match (ctrl, shift, keyval) {
             // Ctrl+Shift+N → new workspace
             (true, true, gdk::Key::N | gdk::Key::n) => {
@@ -384,7 +440,15 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
 // Sidebar row
 // ---------------------------------------------------------------------------
 
-fn build_sidebar_row(name: &str) -> (gtk::ListBoxRow, gtk::Label, gtk::Label, gtk::Label) {
+fn build_sidebar_row(
+    name: &str,
+) -> (
+    gtk::ListBoxRow,
+    gtk::Label,
+    gtk::Button,
+    gtk::Label,
+    gtk::Label,
+) {
     let notify_dot = gtk::Label::builder().label("\u{25CF}").build();
     notify_dot.add_css_class("cmux-notify-dot-hidden");
 
@@ -396,9 +460,18 @@ fn build_sidebar_row(name: &str) -> (gtk::ListBoxRow, gtk::Label, gtk::Label, gt
         .build();
     name_label.add_css_class("cmux-ws-name");
 
+    let favorite_button = gtk::Button::with_label("\u{2606}");
+    favorite_button.add_css_class("flat");
+    favorite_button.add_css_class("cmux-ws-star-btn");
+    favorite_button.set_focus_on_click(false);
+    favorite_button.set_valign(gtk::Align::Center);
+    favorite_button.set_halign(gtk::Align::End);
+    favorite_button.set_tooltip_text(Some("Favorite workspace"));
+
     let top_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     top_row.append(&notify_dot);
     top_row.append(&name_label);
+    top_row.append(&favorite_button);
 
     let notify_label = gtk::Label::builder()
         .xalign(0.0)
@@ -419,12 +492,311 @@ fn build_sidebar_row(name: &str) -> (gtk::ListBoxRow, gtk::Label, gtk::Label, gt
     let row = gtk::ListBoxRow::new();
     row.set_child(Some(&vbox));
 
-    (row, name_label, notify_dot, notify_label)
+    (row, name_label, favorite_button, notify_dot, notify_label)
 }
 
 // ---------------------------------------------------------------------------
 // Workspace management
 // ---------------------------------------------------------------------------
+
+fn favorites_prefix_len(flags: &[bool]) -> usize {
+    flags.iter().take_while(|is_favorite| **is_favorite).count()
+}
+
+fn clamp_workspace_insert_index_for_pinning(
+    favorite_flags_after_removal: &[bool],
+    moving_is_favorite: bool,
+    proposed_index: usize,
+) -> usize {
+    let favorites_top = favorites_prefix_len(favorite_flags_after_removal);
+    if moving_is_favorite {
+        proposed_index.min(favorites_top)
+    } else {
+        proposed_index.max(favorites_top)
+    }
+}
+
+fn sync_sidebar_row_order(state: &mut AppState) {
+    while let Some(child) = state.sidebar_list.first_child() {
+        state.sidebar_list.remove(&child);
+    }
+    for workspace in &state.workspaces {
+        state.sidebar_list.append(&workspace.sidebar_row);
+    }
+}
+
+fn set_workspace_favorite_visual(workspace: &Workspace) {
+    let symbol = if workspace.favorite { "\u{2605}" } else { "\u{2606}" };
+    workspace.favorite_button.set_label(symbol);
+    if workspace.favorite {
+        workspace.favorite_button.add_css_class("cmux-ws-star-btn-active");
+    } else {
+        workspace.favorite_button.remove_css_class("cmux-ws-star-btn-active");
+    }
+}
+
+/// Find any active rename Entry in the sidebar and trigger its activate signal to commit.
+fn commit_any_active_rename(sidebar_list: &gtk::ListBox) {
+    let mut row = sidebar_list.first_child();
+    while let Some(r) = row {
+        // Walk into the row's children to find a gtk::Entry
+        fn find_entry(widget: &gtk::Widget) -> Option<gtk::Entry> {
+            if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                return Some(entry.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                if let Some(entry) = find_entry(&c) {
+                    return Some(entry);
+                }
+                child = c.next_sibling();
+            }
+            None
+        }
+        if let Some(entry) = find_entry(&r) {
+            entry.emit_activate();
+            return;
+        }
+        row = r.next_sibling();
+    }
+}
+
+fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
+    let (label, current_name) = {
+        let s = state.borrow();
+        let Some(workspace) = s.workspaces.iter().find(|workspace| workspace.id == workspace_id) else {
+            return;
+        };
+        (workspace.name_label.clone(), workspace.name.clone())
+    };
+
+    let Some(parent) = label.parent().and_then(|p| p.downcast::<gtk::Box>().ok()) else {
+        return;
+    };
+
+    // Avoid stacking multiple rename entries if the user right-clicks repeatedly.
+    let mut child = parent.first_child();
+    while let Some(widget) = child {
+        if widget.is::<gtk::Entry>() {
+            return;
+        }
+        child = widget.next_sibling();
+    }
+
+    let entry = gtk::Entry::builder()
+        .text(&current_name)
+        .hexpand(true)
+        .build();
+    entry.add_css_class("cmux-ws-rename-entry");
+
+    label.set_visible(false);
+    parent.insert_child_after(&entry, Some(&label));
+    entry.grab_focus();
+    entry.select_region(0, -1);
+
+    let commit_guard = Rc::new(std::cell::Cell::new(false));
+    let state_for_commit = state.clone();
+    let workspace_id = workspace_id.to_string();
+    let label_for_commit = label.clone();
+    let parent_for_commit = parent.clone();
+    let commit = {
+        let commit_guard = commit_guard.clone();
+        move |entry: &gtk::Entry| {
+            if commit_guard.get() {
+                return;
+            }
+            commit_guard.set(true);
+
+            let next_name = entry.text().trim().to_string();
+            if !next_name.is_empty() {
+                label_for_commit.set_label(&next_name);
+                let mut s = state_for_commit.borrow_mut();
+                if let Some(workspace) = s
+                    .workspaces
+                    .iter_mut()
+                    .find(|workspace| workspace.id == workspace_id)
+                {
+                    workspace.name = next_name;
+                }
+            }
+
+            label_for_commit.set_visible(true);
+            parent_for_commit.remove(entry);
+        }
+    };
+
+    {
+        let commit = commit.clone();
+        entry.connect_activate(move |entry| {
+            commit(entry);
+        });
+    }
+    {
+        let commit = commit.clone();
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(move |controller| {
+            if let Some(widget) = controller.widget() {
+                if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+                    commit(entry);
+                }
+            }
+        });
+        entry.add_controller(focus);
+    }
+}
+
+fn reorder_workspace_by_id(state: &State, source_id: &str, target_id: &str) -> bool {
+    let (sidebar_list, row_to_select) = {
+        let mut s = state.borrow_mut();
+        let Some(source_idx) = s.workspaces.iter().position(|workspace| workspace.id == source_id) else {
+            return false;
+        };
+        let Some(target_idx) = s.workspaces.iter().position(|workspace| workspace.id == target_id) else {
+            return false;
+        };
+        if source_idx == target_idx {
+            return false;
+        }
+
+        let active_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
+        let moving_workspace = s.workspaces.remove(source_idx);
+        let Some(target_idx_after_removal) = s
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == target_id)
+        else {
+            s.workspaces.insert(source_idx, moving_workspace);
+            return false;
+        };
+
+        let favorite_flags: Vec<bool> = s.workspaces.iter().map(|workspace| workspace.favorite).collect();
+        let insert_idx = clamp_workspace_insert_index_for_pinning(
+            &favorite_flags,
+            moving_workspace.favorite,
+            target_idx_after_removal,
+        );
+        s.workspaces.insert(insert_idx, moving_workspace);
+
+        if let Some(active_workspace_id) = active_workspace_id {
+            if let Some(new_active_idx) = s
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == active_workspace_id)
+            {
+                s.active_idx = new_active_idx;
+            }
+        }
+
+        sync_sidebar_row_order(&mut s);
+        let row_to_select = s.workspaces.get(s.active_idx).map(|workspace| workspace.sidebar_row.clone());
+        (s.sidebar_list.clone(), row_to_select)
+    };
+
+    if let Some(row) = row_to_select {
+        sidebar_list.select_row(Some(&row));
+    }
+
+    true
+}
+
+fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
+    let (sidebar_list, row_to_select) = {
+        let mut s = state.borrow_mut();
+        let Some(idx) = s
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+
+        let active_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
+        s.workspaces[idx].favorite = !s.workspaces[idx].favorite;
+        set_workspace_favorite_visual(&s.workspaces[idx]);
+
+        let workspace = s.workspaces.remove(idx);
+        let favorite_flags: Vec<bool> = s.workspaces.iter().map(|candidate| candidate.favorite).collect();
+        let insert_idx = favorites_prefix_len(&favorite_flags);
+        s.workspaces.insert(insert_idx, workspace);
+
+        if let Some(active_workspace_id) = active_workspace_id {
+            if let Some(new_active_idx) = s
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == active_workspace_id)
+            {
+                s.active_idx = new_active_idx;
+            }
+        }
+
+        sync_sidebar_row_order(&mut s);
+        let row_to_select = s.workspaces.get(s.active_idx).map(|workspace| workspace.sidebar_row.clone());
+        (s.sidebar_list.clone(), row_to_select)
+    };
+
+    if let Some(row) = row_to_select {
+        sidebar_list.select_row(Some(&row));
+    }
+}
+
+fn install_workspace_row_interactions(
+    state: &State,
+    workspace_id: &str,
+    row: &gtk::ListBoxRow,
+    favorite_button: &gtk::Button,
+) {
+    // Right click starts inline rename.
+    let right_click = gtk::GestureClick::new();
+    right_click.set_button(3);
+    {
+        let state = state.clone();
+        let workspace_id = workspace_id.to_string();
+        right_click.connect_pressed(move |_, _, _, _| {
+            begin_workspace_inline_rename(&state, &workspace_id);
+        });
+    }
+    row.add_controller(right_click);
+
+    // Drag source for sidebar reordering.
+    let drag_source = gtk::DragSource::new();
+    drag_source.set_actions(gtk::gdk::DragAction::MOVE);
+    {
+        let workspace_id = workspace_id.to_string();
+        drag_source.connect_prepare(move |_, _, _| {
+            let payload = glib::Value::from(&workspace_id);
+            Some(gtk::gdk::ContentProvider::for_value(&payload))
+        });
+    }
+    row.add_controller(drag_source);
+
+    // Drop target for sidebar reordering.
+    let drop_target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+    {
+        let state = state.clone();
+        let target_workspace_id = workspace_id.to_string();
+        drop_target.connect_drop(move |_, value, _, _| {
+            if let Ok(source_workspace_id) = value.get::<String>() {
+                if source_workspace_id != target_workspace_id {
+                    return reorder_workspace_by_id(
+                        &state,
+                        &source_workspace_id,
+                        &target_workspace_id,
+                    );
+                }
+            }
+            false
+        });
+    }
+    row.add_controller(drop_target);
+
+    {
+        let state = state.clone();
+        let workspace_id = workspace_id.to_string();
+        favorite_button.connect_clicked(move |_| {
+            toggle_workspace_favorite(&state, &workspace_id);
+        });
+    }
+}
 
 fn add_workspace(state: &State, working_directory: Option<&str>) {
     let mut s = state.borrow_mut();
@@ -453,8 +825,9 @@ fn add_workspace(state: &State, working_directory: Option<&str>) {
 
     s.stack.add_named(&root, Some(&stack_name));
 
-    let (row, name_label, notify_dot, notify_label) = build_sidebar_row(&name);
+    let (row, name_label, favorite_button, notify_dot, notify_label) = build_sidebar_row(&name);
     s.sidebar_list.append(&row);
+    install_workspace_row_interactions(state, &id, &row, &favorite_button);
 
     let ws = Workspace {
         id,
@@ -462,9 +835,11 @@ fn add_workspace(state: &State, working_directory: Option<&str>) {
         root,
         sidebar_row: row.clone(),
         name_label,
+        favorite_button,
         notify_dot,
         notify_label,
         unread: false,
+        favorite: false,
     };
 
     s.workspaces.push(ws);
@@ -785,5 +1160,42 @@ fn mark_workspace_unread(state: &State, ws_id: &str) {
             ws.notify_label.add_css_class("cmux-notify-msg-unread");
             ws.notify_label.set_visible(true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_workspace_insert_index_for_pinning, favorites_prefix_len};
+
+    #[test]
+    fn favorites_prefix_len_counts_only_leading_favorites() {
+        let flags = [true, true, false, true, false];
+        assert_eq!(favorites_prefix_len(&flags), 2);
+    }
+
+    #[test]
+    fn unpinned_workspace_cannot_move_above_favorites() {
+        // Remaining order after removing dragged workspace:
+        // [fav, fav, unfav, unfav]
+        let after_removal = [true, true, false, false];
+        let clamped = clamp_workspace_insert_index_for_pinning(
+            &after_removal,
+            false,
+            0,
+        );
+        assert_eq!(clamped, 2);
+    }
+
+    #[test]
+    fn favorite_workspace_cannot_move_below_unpinned() {
+        // Remaining order after removing dragged favorite:
+        // [fav, fav, unfav, unfav]
+        let after_removal = [true, true, false, false];
+        let clamped = clamp_workspace_insert_index_for_pinning(
+            &after_removal,
+            true,
+            after_removal.len(),
+        );
+        assert_eq!(clamped, 2);
     }
 }
