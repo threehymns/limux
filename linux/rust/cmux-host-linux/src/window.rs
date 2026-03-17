@@ -120,6 +120,18 @@ row:selected .cmux-ws-star-btn {
     color: white;
     font-weight: 700;
 }
+.cmux-drop-above .cmux-sidebar-row-box {
+    border-top: 2px solid #0091FF;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+    padding-top: 4px;
+}
+.cmux-drop-below .cmux-sidebar-row-box {
+    border-bottom: 2px solid #0091FF;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    padding-bottom: 4px;
+}
 .cmux-sidebar-title {
     color: rgba(255, 255, 255, 0.5);
     font-size: 11px;
@@ -671,7 +683,7 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
     }
 }
 
-fn reorder_workspace_by_id(state: &State, source_id: &str, target_id: &str) -> bool {
+fn reorder_workspace_by_id(state: &State, source_id: &str, target_id: &str, drop_below: bool) -> bool {
     let (sidebar_list, row_to_select) = {
         let mut s = state.borrow_mut();
         let Some(source_idx) = s
@@ -703,6 +715,13 @@ fn reorder_workspace_by_id(state: &State, source_id: &str, target_id: &str) -> b
             return false;
         };
 
+        // Insert after the target when dropping on the bottom half
+        let raw_insert_idx = if drop_below {
+            target_idx_after_removal + 1
+        } else {
+            target_idx_after_removal
+        };
+
         let favorite_flags: Vec<bool> = s
             .workspaces
             .iter()
@@ -711,7 +730,7 @@ fn reorder_workspace_by_id(state: &State, source_id: &str, target_id: &str) -> b
         let insert_idx = clamp_workspace_insert_index_for_pinning(
             &favorite_flags,
             moving_workspace.favorite,
-            target_idx_after_removal,
+            raw_insert_idx,
         );
         s.workspaces.insert(insert_idx, moving_workspace);
 
@@ -817,18 +836,45 @@ fn install_workspace_row_interactions(
     }
     row.add_controller(drag_source);
 
-    // Drop target for sidebar reordering.
+    // Drop target for sidebar reordering with visual feedback.
     let drop_target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+    drop_target.set_preload(true);
+    {
+        let r = row.clone();
+        drop_target.connect_motion(move |_, _x, y| {
+            let h = r.height() as f64;
+            r.remove_css_class("cmux-drop-above");
+            r.remove_css_class("cmux-drop-below");
+            if y < h / 2.0 {
+                r.add_css_class("cmux-drop-above");
+            } else {
+                r.add_css_class("cmux-drop-below");
+            }
+            gtk::gdk::DragAction::MOVE
+        });
+    }
+    {
+        let r = row.clone();
+        drop_target.connect_leave(move |_| {
+            r.remove_css_class("cmux-drop-above");
+            r.remove_css_class("cmux-drop-below");
+        });
+    }
     {
         let state = state.clone();
         let target_workspace_id = workspace_id.to_string();
-        drop_target.connect_drop(move |_, value, _, _| {
+        let r = row.clone();
+        drop_target.connect_drop(move |dt, value, _, y| {
+            r.remove_css_class("cmux-drop-above");
+            r.remove_css_class("cmux-drop-below");
+            let drop_below = y >= r.height() as f64 / 2.0;
             if let Ok(source_workspace_id) = value.get::<String>() {
                 if source_workspace_id != target_workspace_id {
                     return reorder_workspace_by_id(
                         &state,
                         &source_workspace_id,
                         &target_workspace_id,
+                        drop_below,
                     );
                 }
             }
