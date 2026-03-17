@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4 as gtk;
-use gtk::prelude::*;
-use gtk::glib;
-use libadwaita as adw;
 use adw::prelude::*;
+use gtk::glib;
+use gtk::prelude::*;
+use gtk4 as gtk;
+use libadwaita as adw;
 
 use crate::pane::{self, PaneCallbacks};
 
@@ -111,6 +111,15 @@ row:selected .cmux-ws-star-btn {
     color: rgba(0, 145, 255, 0.8);
     font-size: 11px;
 }
+.cmux-sidebar-row-unread {
+    background-color: rgba(0, 145, 255, 0.18);
+    border-left: 3px solid #0091FF;
+    border-radius: 6px;
+}
+.cmux-sidebar-row-unread .cmux-ws-name {
+    color: white;
+    font-weight: 700;
+}
 .cmux-sidebar-title {
     color: rgba(255, 255, 255, 0.5);
     font-size: 11px;
@@ -158,9 +167,14 @@ pub fn build_window(app: &adw::Application) {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     // Try several possible icon locations
     for candidate in &[
-        exe_dir.as_ref().map(|d| d.join("../../rust/cmux-host-linux/icons")),
+        exe_dir
+            .as_ref()
+            .map(|d| d.join("../../rust/cmux-host-linux/icons")),
         exe_dir.as_ref().map(|d| d.join("../icons")),
-        Some(std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/icons"))),
+        Some(std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/icons"
+        ))),
     ] {
         if let Some(path) = candidate {
             if path.exists() {
@@ -171,13 +185,13 @@ pub fn build_window(app: &adw::Application) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("cmux")
+        .title("Limux")
         .default_width(1400)
         .default_height(900)
         .build();
 
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&gtk::Label::builder().label("cmux").build()));
+    header.set_title_widget(Some(&gtk::Label::builder().label("Limux").build()));
 
     let stack = gtk::Stack::new();
     stack.set_transition_type(gtk::StackTransitionType::None);
@@ -293,15 +307,13 @@ fn register_actions(window: &adw::ApplicationWindow, state: &State) {
         let action = gtk::gio::SimpleAction::new(name, None);
         let state = state.clone();
         let handler_name = name.to_string();
-        action.connect_activate(move |_, _| {
-            match handler_name.as_str() {
-                "new-workspace" => add_workspace(&state, None),
-                "close-workspace" => close_workspace(&state),
-                "toggle-sidebar" => toggle_sidebar(&state),
-                "next-workspace" => cycle_workspace(&state, 1),
-                "prev-workspace" => cycle_workspace(&state, -1),
-                _ => {}
-            }
+        action.connect_activate(move |_, _| match handler_name.as_str() {
+            "new-workspace" => add_workspace(&state, None),
+            "close-workspace" => close_workspace(&state),
+            "toggle-sidebar" => toggle_sidebar(&state),
+            "next-workspace" => cycle_workspace(&state, 1),
+            "prev-workspace" => cycle_workspace(&state, -1),
+            _ => {}
         });
         window.add_action(&action);
     }
@@ -401,15 +413,20 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
                     gdk::Key::_9 => {
                         // Ctrl+9 always goes to last workspace
                         let s = state.borrow();
-                        if s.workspaces.is_empty() { None }
-                        else { Some(s.workspaces.len() - 1) }
+                        if s.workspaces.is_empty() {
+                            None
+                        } else {
+                            Some(s.workspaces.len() - 1)
+                        }
                     }
                     _ => None,
                 };
                 if let Some(idx) = digit {
                     let row_and_list = {
                         let s = state.borrow();
-                        s.workspaces.get(idx).map(|ws| (ws.sidebar_row.clone(), s.sidebar_list.clone()))
+                        s.workspaces
+                            .get(idx)
+                            .map(|ws| (ws.sidebar_row.clone(), s.sidebar_list.clone()))
                     };
                     switch_workspace(&state, idx);
                     if let Some((row, list)) = row_and_list {
@@ -523,12 +540,20 @@ fn sync_sidebar_row_order(state: &mut AppState) {
 }
 
 fn set_workspace_favorite_visual(workspace: &Workspace) {
-    let symbol = if workspace.favorite { "\u{2605}" } else { "\u{2606}" };
+    let symbol = if workspace.favorite {
+        "\u{2605}"
+    } else {
+        "\u{2606}"
+    };
     workspace.favorite_button.set_label(symbol);
     if workspace.favorite {
-        workspace.favorite_button.add_css_class("cmux-ws-star-btn-active");
+        workspace
+            .favorite_button
+            .add_css_class("cmux-ws-star-btn-active");
     } else {
-        workspace.favorite_button.remove_css_class("cmux-ws-star-btn-active");
+        workspace
+            .favorite_button
+            .remove_css_class("cmux-ws-star-btn-active");
     }
 }
 
@@ -561,7 +586,11 @@ fn commit_any_active_rename(sidebar_list: &gtk::ListBox) {
 fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
     let (label, current_name) = {
         let s = state.borrow();
-        let Some(workspace) = s.workspaces.iter().find(|workspace| workspace.id == workspace_id) else {
+        let Some(workspace) = s
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
             return;
         };
         (workspace.name_label.clone(), workspace.name.clone())
@@ -645,10 +674,18 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
 fn reorder_workspace_by_id(state: &State, source_id: &str, target_id: &str) -> bool {
     let (sidebar_list, row_to_select) = {
         let mut s = state.borrow_mut();
-        let Some(source_idx) = s.workspaces.iter().position(|workspace| workspace.id == source_id) else {
+        let Some(source_idx) = s
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == source_id)
+        else {
             return false;
         };
-        let Some(target_idx) = s.workspaces.iter().position(|workspace| workspace.id == target_id) else {
+        let Some(target_idx) = s
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == target_id)
+        else {
             return false;
         };
         if source_idx == target_idx {
@@ -666,7 +703,11 @@ fn reorder_workspace_by_id(state: &State, source_id: &str, target_id: &str) -> b
             return false;
         };
 
-        let favorite_flags: Vec<bool> = s.workspaces.iter().map(|workspace| workspace.favorite).collect();
+        let favorite_flags: Vec<bool> = s
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.favorite)
+            .collect();
         let insert_idx = clamp_workspace_insert_index_for_pinning(
             &favorite_flags,
             moving_workspace.favorite,
@@ -685,7 +726,10 @@ fn reorder_workspace_by_id(state: &State, source_id: &str, target_id: &str) -> b
         }
 
         sync_sidebar_row_order(&mut s);
-        let row_to_select = s.workspaces.get(s.active_idx).map(|workspace| workspace.sidebar_row.clone());
+        let row_to_select = s
+            .workspaces
+            .get(s.active_idx)
+            .map(|workspace| workspace.sidebar_row.clone());
         (s.sidebar_list.clone(), row_to_select)
     };
 
@@ -712,7 +756,11 @@ fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
         set_workspace_favorite_visual(&s.workspaces[idx]);
 
         let workspace = s.workspaces.remove(idx);
-        let favorite_flags: Vec<bool> = s.workspaces.iter().map(|candidate| candidate.favorite).collect();
+        let favorite_flags: Vec<bool> = s
+            .workspaces
+            .iter()
+            .map(|candidate| candidate.favorite)
+            .collect();
         let insert_idx = favorites_prefix_len(&favorite_flags);
         s.workspaces.insert(insert_idx, workspace);
 
@@ -727,7 +775,10 @@ fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
         }
 
         sync_sidebar_row_order(&mut s);
-        let row_to_select = s.workspaces.get(s.active_idx).map(|workspace| workspace.sidebar_row.clone());
+        let row_to_select = s
+            .workspaces
+            .get(s.active_idx)
+            .map(|workspace| workspace.sidebar_row.clone());
         (s.sidebar_list.clone(), row_to_select)
     };
 
@@ -948,6 +999,10 @@ fn switch_workspace(state: &State, idx: usize) {
         ws.notify_dot.add_css_class("cmux-notify-dot-hidden");
         ws.notify_label.remove_css_class("cmux-notify-msg-unread");
         ws.notify_label.add_css_class("cmux-notify-msg");
+        // Remove glow pulse from sidebar row
+        if let Some(row_box) = ws.sidebar_row.child() {
+            row_box.remove_css_class("cmux-sidebar-row-unread");
+        }
     }
 }
 
@@ -955,9 +1010,15 @@ fn cycle_workspace(state: &State, direction: i32) {
     let (new_idx, row, sidebar_list) = {
         let s = state.borrow();
         let len = s.workspaces.len();
-        if len <= 1 { return; }
+        if len <= 1 {
+            return;
+        }
         let new_idx = ((s.active_idx as i32 + direction).rem_euclid(len as i32)) as usize;
-        (new_idx, s.workspaces[new_idx].sidebar_row.clone(), s.sidebar_list.clone())
+        (
+            new_idx,
+            s.workspaces[new_idx].sidebar_row.clone(),
+            s.sidebar_list.clone(),
+        )
     };
     switch_workspace(state, new_idx);
     sidebar_list.select_row(Some(&row));
@@ -992,7 +1053,8 @@ fn split_pane(
 
     if let Some(parent) = parent {
         if let Some(paned_parent) = parent.downcast_ref::<gtk::Paned>() {
-            let is_start = paned_parent.start_child()
+            let is_start = paned_parent
+                .start_child()
                 .map(|c| c == *pane_widget)
                 .unwrap_or(false);
             if is_start {
@@ -1026,7 +1088,9 @@ fn split_pane(
             } else {
                 alloc.height()
             };
-            if size > 0 { np.set_position(size / 2); }
+            if size > 0 {
+                np.set_position(size / 2);
+            }
         });
     }
 }
@@ -1034,11 +1098,17 @@ fn split_pane(
 fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
     let parent = pane_widget.parent();
 
-    let Some(parent) = parent else { return; };
+    let Some(parent) = parent else {
+        return;
+    };
 
     if let Some(paned) = parent.downcast_ref::<gtk::Paned>() {
         // Find sibling
-        let sibling = if paned.start_child().map(|c| c == *pane_widget).unwrap_or(false) {
+        let sibling = if paned
+            .start_child()
+            .map(|c| c == *pane_widget)
+            .unwrap_or(false)
+        {
             paned.end_child()
         } else {
             paned.start_child()
@@ -1050,7 +1120,8 @@ fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
 
             if let Some(grandparent) = paned.parent() {
                 if let Some(gp_paned) = grandparent.downcast_ref::<gtk::Paned>() {
-                    let is_start = gp_paned.start_child()
+                    let is_start = gp_paned
+                        .start_child()
                         .map(|c| c == paned.clone().upcast::<gtk::Widget>())
                         .unwrap_or(false);
                     if is_start {
@@ -1143,10 +1214,10 @@ fn focus_pane_in_direction(state: &State, direction: Direction) {
 
     // Determine which axis and sides we care about.
     let (target_orientation, must_be_start) = match direction {
-        Direction::Left  => (gtk::Orientation::Horizontal, false), // must be end_child to go left
-        Direction::Right => (gtk::Orientation::Horizontal, true),  // must be start_child to go right
-        Direction::Up    => (gtk::Orientation::Vertical,   false), // must be end_child to go up
-        Direction::Down  => (gtk::Orientation::Vertical,   true),  // must be start_child to go down
+        Direction::Left => (gtk::Orientation::Horizontal, false), // must be end_child to go left
+        Direction::Right => (gtk::Orientation::Horizontal, true), // must be start_child to go right
+        Direction::Up => (gtk::Orientation::Vertical, false),     // must be end_child to go up
+        Direction::Down => (gtk::Orientation::Vertical, true),    // must be start_child to go down
     };
 
     // Walk up from the focused pane to find a gtk::Paned with the right
@@ -1159,9 +1230,7 @@ fn focus_pane_in_direction(state: &State, direction: Direction) {
         };
         if let Some(paned) = parent.downcast_ref::<gtk::Paned>() {
             if paned.orientation() == target_orientation {
-                let is_start = paned.start_child()
-                    .map(|c| c == current)
-                    .unwrap_or(false);
+                let is_start = paned.start_child().map(|c| c == current).unwrap_or(false);
                 if is_start == must_be_start {
                     // Found the split point. Navigate to the sibling subtree.
                     let sibling = if must_be_start {
@@ -1231,7 +1300,12 @@ fn make_pane_callbacks(state: &State, ws_id: &str) -> Rc<PaneCallbacks> {
 fn mark_workspace_unread(state: &State, ws_id: &str) {
     let mut s = state.borrow_mut();
     let active_idx = s.active_idx;
-    if let Some((idx, ws)) = s.workspaces.iter_mut().enumerate().find(|(_, w)| w.id == ws_id) {
+    if let Some((idx, ws)) = s
+        .workspaces
+        .iter_mut()
+        .enumerate()
+        .find(|(_, w)| w.id == ws_id)
+    {
         if idx != active_idx {
             ws.unread = true;
             ws.notify_dot.remove_css_class("cmux-notify-dot-hidden");
@@ -1240,6 +1314,10 @@ fn mark_workspace_unread(state: &State, ws_id: &str) {
             ws.notify_label.remove_css_class("cmux-notify-msg");
             ws.notify_label.add_css_class("cmux-notify-msg-unread");
             ws.notify_label.set_visible(true);
+            // Add glow pulse to the sidebar row box
+            if let Some(row_box) = ws.sidebar_row.child() {
+                row_box.add_css_class("cmux-sidebar-row-unread");
+            }
         }
     }
 }
@@ -1259,11 +1337,7 @@ mod tests {
         // Remaining order after removing dragged workspace:
         // [fav, fav, unfav, unfav]
         let after_removal = [true, true, false, false];
-        let clamped = clamp_workspace_insert_index_for_pinning(
-            &after_removal,
-            false,
-            0,
-        );
+        let clamped = clamp_workspace_insert_index_for_pinning(&after_removal, false, 0);
         assert_eq!(clamped, 2);
     }
 
@@ -1272,11 +1346,8 @@ mod tests {
         // Remaining order after removing dragged favorite:
         // [fav, fav, unfav, unfav]
         let after_removal = [true, true, false, false];
-        let clamped = clamp_workspace_insert_index_for_pinning(
-            &after_removal,
-            true,
-            after_removal.len(),
-        );
+        let clamped =
+            clamp_workspace_insert_index_for_pinning(&after_removal, true, after_removal.len());
         assert_eq!(clamped, 2);
     }
 }

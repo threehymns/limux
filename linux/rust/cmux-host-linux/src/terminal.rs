@@ -1,6 +1,6 @@
-use gtk4 as gtk;
 use gtk::glib;
 use gtk::prelude::*;
+use gtk4 as gtk;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -170,9 +170,7 @@ unsafe extern "C" fn ghostty_action_cb(
 /// Find the first surface pointer from the surface map.
 /// Used by clipboard callbacks that receive null userdata.
 fn find_any_surface() -> Option<ghostty_surface_t> {
-    SURFACE_MAP.with(|map| {
-        map.borrow().keys().next().map(|&k| k as ghostty_surface_t)
-    })
+    SURFACE_MAP.with(|map| map.borrow().keys().next().map(|&k| k as ghostty_surface_t))
 }
 
 unsafe extern "C" fn ghostty_read_clipboard_cb(
@@ -212,12 +210,7 @@ unsafe extern "C" fn ghostty_read_clipboard_cb(
         let clean = text.replace('\0', "");
         if let Ok(cstr) = CString::new(clean) {
             unsafe {
-                ghostty_surface_complete_clipboard_request(
-                    surface_ptr,
-                    cstr.as_ptr(),
-                    state,
-                    true,
-                );
+                ghostty_surface_complete_clipboard_request(surface_ptr, cstr.as_ptr(), state, true);
             }
         }
     });
@@ -238,12 +231,7 @@ unsafe extern "C" fn ghostty_confirm_read_clipboard_cb(
         }
     };
     unsafe {
-        ghostty_surface_complete_clipboard_request(
-            surface_ptr,
-            text,
-            state,
-            true,
-        );
+        ghostty_surface_complete_clipboard_request(surface_ptr, text, state, true);
     }
 }
 
@@ -510,12 +498,8 @@ pub fn create_terminal(
                     .map(|c| c.encode_utf8(&mut text_buf) as &str)
                     .and_then(|s| CString::new(s).ok());
 
-                let mut event = translate_key_event(
-                    GHOSTTY_ACTION_PRESS,
-                    keyval,
-                    keycode,
-                    modifier,
-                );
+                let mut event =
+                    translate_key_event(GHOSTTY_ACTION_PRESS, keyval, keycode, modifier);
                 if let Some(ref ct) = c_text {
                     event.text = ct.as_ptr();
                 }
@@ -530,12 +514,7 @@ pub fn create_terminal(
 
         key_controller.connect_key_released(move |_ctrl, keyval, keycode, modifier| {
             if let Some(surface) = *sc_release.borrow() {
-                let event = translate_key_event(
-                    GHOSTTY_ACTION_RELEASE,
-                    keyval,
-                    keycode,
-                    modifier,
-                );
+                let event = translate_key_event(GHOSTTY_ACTION_RELEASE, keyval, keycode, modifier);
                 unsafe { ghostty_surface_key(surface, event) };
             }
         });
@@ -605,13 +584,13 @@ pub fn create_terminal(
     {
         let surface_cell = surface_cell.clone();
         let scroll = gtk::EventControllerScroll::new(
-            gtk::EventControllerScrollFlags::BOTH_AXES
-                | gtk::EventControllerScrollFlags::DISCRETE,
+            gtk::EventControllerScrollFlags::BOTH_AXES | gtk::EventControllerScrollFlags::DISCRETE,
         );
         scroll.connect_scroll(move |ctrl, dx, dy| {
             if let Some(surface) = *surface_cell.borrow() {
                 let mods = translate_mouse_mods(ctrl.current_event_state());
-                unsafe { ghostty_surface_mouse_scroll(surface, dx, dy, mods) };
+                // GTK and Ghostty use opposite scroll conventions — negate both axes
+                unsafe { ghostty_surface_mouse_scroll(surface, -dx, -dy, mods) };
             }
             glib::Propagation::Stop
         });
@@ -695,15 +674,28 @@ fn translate_key_event(
         mods |= GHOSTTY_MODS_SUPER;
     }
 
-    let codepoint = keyval.to_unicode().map(|c| c as u32).unwrap_or(0);
+    // unshifted_codepoint must be the codepoint WITHOUT shift applied.
+    // keyval already includes shift (e.g., Shift+a → 'A'), so use to_lower().
+    let unshifted = keyval.to_lower().to_unicode().map(|c| c as u32).unwrap_or(0);
+
+    // Mark shift as consumed when it produced a different character
+    // (e.g., a→A, 1→!). This tells Ghostty not to treat shift as
+    // a separate modifier for keybinding matching.
+    let mut consumed: c_int = GHOSTTY_MODS_NONE;
+    if modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        let shifted = keyval.to_unicode().map(|c| c as u32).unwrap_or(0);
+        if shifted != 0 && shifted != unshifted {
+            consumed |= GHOSTTY_MODS_SHIFT;
+        }
+    }
 
     ghostty_input_key_s {
         action,
         mods,
-        consumed_mods: GHOSTTY_MODS_NONE,
+        consumed_mods: consumed,
         keycode,
         text: ptr::null(),
-        unshifted_codepoint: codepoint,
+        unshifted_codepoint: unshifted,
         composing: false,
     }
 }

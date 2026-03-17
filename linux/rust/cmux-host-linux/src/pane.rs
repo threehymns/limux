@@ -6,9 +6,9 @@
 
 use std::rc::Rc;
 
-use gtk4 as gtk;
-use gtk::prelude::*;
 use gtk::glib;
+use gtk::prelude::*;
+use gtk4 as gtk;
 
 use crate::terminal::{self, TerminalCallbacks};
 
@@ -126,10 +126,7 @@ pub const PANE_CSS: &str = r#"
 // PaneWidget builder
 // ---------------------------------------------------------------------------
 
-pub fn create_pane(
-    callbacks: Rc<PaneCallbacks>,
-    working_directory: Option<&str>,
-) -> gtk::Box {
+pub fn create_pane(callbacks: Rc<PaneCallbacks>, working_directory: Option<&str>) -> gtk::Box {
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .hexpand(true)
@@ -325,7 +322,15 @@ fn add_terminal_tab_inner(
     let tab_id = next_tab_id();
 
     // Tab label button
-    let (tab_btn, title_label) = build_tab_button("Terminal", &tab_id, tab_strip, content_stack, tab_state, callbacks, pane_outer);
+    let (tab_btn, title_label) = build_tab_button(
+        "Terminal",
+        &tab_id,
+        tab_strip,
+        content_stack,
+        tab_state,
+        callbacks,
+        pane_outer,
+    );
 
     // Build Ghostty terminal callbacks for title/bell/close
     let term_callbacks = {
@@ -342,9 +347,14 @@ fn add_terminal_tab_inner(
 
         TerminalCallbacks {
             on_title_changed: Box::new(move |title: &str| {
-                let has_custom = state_for_title.borrow().tabs.iter()
+                let has_custom = state_for_title
+                    .borrow()
+                    .tabs
+                    .iter()
                     .any(|e| e.id == tid_for_title && e.custom_name.is_some());
-                if has_custom { return; }
+                if has_custom {
+                    return;
+                }
                 if !title.is_empty() {
                     let display = if title.len() > 22 {
                         format!("{}…", &title[..21])
@@ -402,7 +412,15 @@ fn add_browser_tab_inner(
     let tab_id = next_tab_id();
     let (widget, title) = create_browser_widget();
 
-    let (tab_btn, title_label) = build_tab_button(&title, &tab_id, tab_strip, content_stack, tab_state, callbacks, pane_outer);
+    let (tab_btn, title_label) = build_tab_button(
+        &title,
+        &tab_id,
+        tab_strip,
+        content_stack,
+        tab_state,
+        callbacks,
+        pane_outer,
+    );
 
     content_stack.add_named(&widget, Some(&tab_id));
 
@@ -429,23 +447,40 @@ pub fn add_terminal_tab_to_notebook(
 ) {
     if let Some((header, content_stack, tab_state, pane_outer)) = find_pane_internals(pane_widget) {
         if let Some(tab_strip) = find_tab_strip(&header) {
-            add_terminal_tab_inner(&tab_strip, &content_stack, &tab_state, callbacks, working_directory, &pane_outer);
+            add_terminal_tab_inner(
+                &tab_strip,
+                &content_stack,
+                &tab_state,
+                callbacks,
+                working_directory,
+                &pane_outer,
+            );
         }
     }
 }
 
-pub fn add_browser_tab_to_pane(
-    pane_widget: &gtk::Widget,
-    callbacks: &Rc<PaneCallbacks>,
-) {
+pub fn add_browser_tab_to_pane(pane_widget: &gtk::Widget, callbacks: &Rc<PaneCallbacks>) {
     if let Some((header, content_stack, tab_state, pane_outer)) = find_pane_internals(pane_widget) {
         if let Some(tab_strip) = find_tab_strip(&header) {
-            add_browser_tab_inner(&tab_strip, &content_stack, &tab_state, callbacks, &pane_outer);
+            add_browser_tab_inner(
+                &tab_strip,
+                &content_stack,
+                &tab_state,
+                callbacks,
+                &pane_outer,
+            );
         }
     }
 }
 
-fn find_pane_internals(_pane_widget: &gtk::Widget) -> Option<(gtk::Box, gtk::Stack, Rc<std::cell::RefCell<TabState>>, gtk::Box)> {
+fn find_pane_internals(
+    _pane_widget: &gtk::Widget,
+) -> Option<(
+    gtk::Box,
+    gtk::Stack,
+    Rc<std::cell::RefCell<TabState>>,
+    gtk::Box,
+)> {
     // For now, this is not easily retrievable since we don't store references.
     // The toolbar buttons wire directly. Keyboard shortcuts go through the
     // create_pane closures. This is a TODO for later refactoring.
@@ -537,10 +572,7 @@ fn build_tab_button(
         let pin = pin_icon.clone();
         let tb = tab_btn.clone();
         right_click.connect_pressed(move |_gesture, _, _x, _y| {
-            show_tab_context_menu(
-                &tb,
-                &tid, &ts, &cs, &state, &cb, &po, &lbl, &pin,
-            );
+            show_tab_context_menu(&tb, &tid, &ts, &cs, &state, &cb, &po, &lbl, &pin);
         });
     }
     tab_btn.add_controller(right_click);
@@ -629,7 +661,11 @@ fn show_tab_context_menu(
     }
 
     // Pin / Unpin
-    let is_pinned = tab_state.borrow().tabs.iter().any(|e| e.id == tab_id && e.pinned);
+    let is_pinned = tab_state
+        .borrow()
+        .tabs
+        .iter()
+        .any(|e| e.id == tab_id && e.pinned);
     let pin_label = if is_pinned { "Unpin" } else { "Pin" };
     let pin_btn = gtk::Button::with_label(pin_label);
     pin_btn.add_css_class("flat");
@@ -689,12 +725,18 @@ fn show_tab_context_menu(
     menu.popup();
 }
 
-fn show_rename_dialog(label: &gtk::Label, tab_state: &Rc<std::cell::RefCell<TabState>>, tab_id: &str) {
+fn show_rename_dialog(
+    label: &gtk::Label,
+    tab_state: &Rc<std::cell::RefCell<TabState>>,
+    tab_id: &str,
+) {
     let current_name = label.label().to_string();
 
     // Replace label with an entry temporarily
     let parent = label.parent().and_then(|p| p.downcast::<gtk::Box>().ok());
-    let Some(parent) = parent else { return; };
+    let Some(parent) = parent else {
+        return;
+    };
 
     let entry = gtk::Entry::builder()
         .text(&current_name)
@@ -723,7 +765,9 @@ fn show_rename_dialog(label: &gtk::Label, tab_state: &Rc<std::cell::RefCell<TabS
         let tid = tid.clone();
         let parent = parent_for_cleanup.clone();
         move |entry: &gtk::Entry| {
-            if commit.get() { return; }
+            if commit.get() {
+                return;
+            }
             commit.set(true);
             let new_name = entry.text().to_string();
             if !new_name.trim().is_empty() {
@@ -740,7 +784,9 @@ fn show_rename_dialog(label: &gtk::Label, tab_state: &Rc<std::cell::RefCell<TabS
 
     {
         let do_rename = do_rename.clone();
-        entry.connect_activate(move |e| { do_rename(e); });
+        entry.connect_activate(move |e| {
+            do_rename(e);
+        });
     }
     {
         let do_rename = do_rename.clone();
@@ -756,11 +802,20 @@ fn show_rename_dialog(label: &gtk::Label, tab_state: &Rc<std::cell::RefCell<TabS
     }
 }
 
-fn reorder_tab(tab_strip: &gtk::Box, tab_state: &Rc<std::cell::RefCell<TabState>>, source_id: &str, target_id: &str) {
+fn reorder_tab(
+    tab_strip: &gtk::Box,
+    tab_state: &Rc<std::cell::RefCell<TabState>>,
+    source_id: &str,
+    target_id: &str,
+) {
     let mut ts = tab_state.borrow_mut();
 
-    let Some(src_idx) = ts.tabs.iter().position(|e| e.id == source_id) else { return; };
-    let Some(tgt_idx) = ts.tabs.iter().position(|e| e.id == target_id) else { return; };
+    let Some(src_idx) = ts.tabs.iter().position(|e| e.id == source_id) else {
+        return;
+    };
+    let Some(tgt_idx) = ts.tabs.iter().position(|e| e.id == target_id) else {
+        return;
+    };
 
     // Move the tab entry
     let entry = ts.tabs.remove(src_idx);
@@ -827,7 +882,9 @@ fn remove_tab(
     pane_outer: &gtk::Box,
 ) {
     let mut ts = tab_state.borrow_mut();
-    let Some(idx) = ts.tabs.iter().position(|e| e.id == tab_id) else { return; };
+    let Some(idx) = ts.tabs.iter().position(|e| e.id == tab_id) else {
+        return;
+    };
     let entry = ts.tabs.remove(idx);
 
     tab_strip.remove(&entry.tab_button);
@@ -856,6 +913,8 @@ fn remove_tab(
 
 #[cfg(feature = "webkit")]
 fn create_browser_widget() -> (gtk::Widget, String) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use webkit6::prelude::*;
 
     // Use a NetworkSession to avoid sandbox issues
@@ -892,15 +951,21 @@ fn create_browser_widget() -> (gtk::Widget, String) {
 
     {
         let wv = webview.clone();
-        back_btn.connect_clicked(move |_| { wv.go_back(); });
+        back_btn.connect_clicked(move |_| {
+            wv.go_back();
+        });
     }
     {
         let wv = webview.clone();
-        fwd_btn.connect_clicked(move |_| { wv.go_forward(); });
+        fwd_btn.connect_clicked(move |_| {
+            wv.go_forward();
+        });
     }
     {
         let wv = webview.clone();
-        reload_btn.connect_clicked(move |_| { wv.reload(); });
+        reload_btn.connect_clicked(move |_| {
+            wv.reload();
+        });
     }
     {
         let wv = webview.clone();
@@ -932,11 +997,18 @@ fn create_browser_widget() -> (gtk::Widget, String) {
     vbox.set_hexpand(true);
     vbox.set_vexpand(true);
 
-    // Defer load_uri until after the widget is realized and mapped
-    let wv = webview.clone();
-    vbox.connect_map(move |_| {
-        wv.load_uri("https://google.com");
-    });
+    // Load default URL only on the first map. The WebView preserves its
+    // page and history across reparenting (splits), so we must not reload.
+    {
+        let wv = webview.clone();
+        let loaded = std::cell::Cell::new(false);
+        vbox.connect_map(move |_| {
+            if !loaded.get() {
+                loaded.set(true);
+                wv.load_uri("https://google.com");
+            }
+        });
+    }
 
     // Suppress unused variable warnings
     let _ = network_session;

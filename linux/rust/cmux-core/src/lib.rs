@@ -4020,9 +4020,14 @@ fn handle_browser_extended_command(
                 .split_surface(Some("browser".to_string()))
                 .ok_or_else(|| CommandError::not_found("no active window"))?;
             state.browser_register_surface(created.id);
-            if let Some(url) = optional_string_param(params, "url")? {
-                state.browser_navigate(url);
-            }
+            let url = optional_string_param(params, "url")?.unwrap_or_else(|| {
+                if state.browser.open {
+                    state.browser.url.clone()
+                } else {
+                    "about:blank".to_string()
+                }
+            });
+            state.browser_navigate(url);
             Ok(
                 json!({ "surface_id": encode_handle_id(created.id), "surface_ref": surface_ref(created.id) }),
             )
@@ -5671,15 +5676,30 @@ fn handle_command(
             let params = params_object(params)?;
             let workspace_id = optional_u64_param_any(params, &["workspace_id"])?;
             let source_surface_id = optional_u64_param_any(params, &["surface_id", "id"])?;
-            let url =
-                optional_string_param(params, "url")?.unwrap_or_else(|| "about:blank".to_string());
             with_workspace_scope(state, workspace_id, |scoped| {
+                let focused_surface_id =
+                    focused_handles(scoped).map(|(_, _, _, surface_id)| surface_id);
+                let source_surface_id = source_surface_id.or(focused_surface_id);
                 let source_pane_id = source_surface_id
                     .and_then(|surface_id| {
                         scoped.find_pane_for_surface_in_current_window(surface_id)
                     })
                     .or_else(|| focused_handles(scoped).map(|(_, _, pane_id, _)| pane_id))
                     .ok_or_else(|| CommandError::not_found("no active pane"))?;
+                let url = optional_string_param(params, "url")?.unwrap_or_else(|| {
+                    let can_inherit_source_url = source_surface_id
+                        .filter(|surface_id| scoped.browser.browser_surfaces.contains(surface_id))
+                        .map(|surface_id| {
+                            scoped.browser.surface_id == Some(surface_id)
+                                || scoped.browser.current_tab_id == surface_id
+                        })
+                        .unwrap_or(false);
+                    if scoped.browser.open && can_inherit_source_url {
+                        scoped.browser.url.clone()
+                    } else {
+                        "about:blank".to_string()
+                    }
+                });
                 let target_pane_id = scoped.right_neighbor_in_current_window(source_pane_id);
 
                 let (created_split, created) = if let Some(target_pane_id) = target_pane_id {
@@ -6764,6 +6784,53 @@ mod tests {
                 .expect("pane rows after right")
                 .len(),
             base_pane_count + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_browser_open_split_without_url_inherits_current_browser_page() {
+        let dispatcher = Dispatcher::new();
+
+        let opened = dispatcher
+            .dispatch(request(
+                "browser.open_split",
+                json!({ "url": "https://example.com/start" }),
+            ))
+            .await;
+        let source_surface_id = opened.result.expect("initial browser open")["surface_id"].clone();
+
+        let navigated = dispatcher
+            .dispatch(request(
+                "browser.navigate",
+                json!({
+                    "surface_id": source_surface_id.clone(),
+                    "url": "https://cmux.dev/docs"
+                }),
+            ))
+            .await;
+        assert_eq!(
+            navigated.result.expect("navigate current browser")["browser"]["url"],
+            "https://cmux.dev/docs"
+        );
+
+        let duplicated = dispatcher
+            .dispatch(request(
+                "browser.open_split",
+                json!({ "surface_id": source_surface_id.clone() }),
+            ))
+            .await;
+        let duplicated_result = duplicated.result.expect("duplicate browser split");
+        assert_eq!(duplicated_result["browser"]["url"], "https://cmux.dev/docs");
+
+        let source_url = dispatcher
+            .dispatch(request(
+                "browser.url.get",
+                json!({ "surface_id": source_surface_id }),
+            ))
+            .await;
+        assert_eq!(
+            source_url.result.expect("source browser url")["url"],
+            "https://cmux.dev/docs"
         );
     }
 
