@@ -1606,7 +1606,7 @@ fn split_pane(
     new_paned.set_start_child(Some(pane_widget));
     new_paned.set_end_child(Some(&new_pane));
 
-    // Animate from full size (new pane hidden) to 50% split
+    // Set 50% split after layout — no animation to avoid GL reparenting flash
     {
         let np = new_paned.clone();
         glib::idle_add_local_once(move || {
@@ -1617,10 +1617,7 @@ fn split_pane(
                 alloc.height()
             };
             if size > 0 {
-                let target = size / 2;
-                // Start with the divider pushed all the way — new pane invisible
-                np.set_position(size);
-                animate_paned_position(&np, size as f64, target as f64, 200);
+                np.set_position(size / 2);
             }
         });
     }
