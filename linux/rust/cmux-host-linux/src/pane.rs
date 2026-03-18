@@ -128,6 +128,10 @@ pub const PANE_CSS: &str = r#"
 // ---------------------------------------------------------------------------
 
 pub fn create_pane(callbacks: Rc<PaneCallbacks>, working_directory: Option<&str>) -> gtk::Box {
+    // Store workspace working directory for new tabs/splits to inherit
+    let ws_wd: Rc<std::cell::RefCell<Option<String>>> =
+        Rc::new(std::cell::RefCell::new(working_directory.map(|s| s.to_string())));
+
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .hexpand(true)
@@ -201,8 +205,10 @@ pub fn create_pane(callbacks: Rc<PaneCallbacks>, working_directory: Option<&str>
         let state = tab_state.clone();
         let cb = callbacks.clone();
         let ow = outer.clone();
+        let wd = ws_wd.clone();
         new_term_btn.connect_clicked(move |_| {
-            add_terminal_tab_inner(&ts, &cs, &state, &cb, None, &ow);
+            let dir = wd.borrow().clone();
+            add_terminal_tab_inner(&ts, &cs, &state, &cb, dir.as_deref(), &ow);
         });
     }
     {

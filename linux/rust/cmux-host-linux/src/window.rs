@@ -1477,7 +1477,19 @@ fn split_pane(
     pane_widget: &gtk::Widget,
     orientation: gtk::Orientation,
 ) {
-    let new_pane = create_pane_for_workspace(state, ws_id, None);
+    // Use the workspace's folder_path (or current cwd) for the new pane
+    let wd = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .find(|w| w.id == ws_id)
+            .and_then(|ws| {
+                ws.folder_path
+                    .clone()
+                    .or_else(|| ws.cwd.borrow().clone())
+            })
+    };
+    let new_pane = create_pane_for_workspace(state, ws_id, wd.as_deref());
 
     let parent = pane_widget.parent();
 
