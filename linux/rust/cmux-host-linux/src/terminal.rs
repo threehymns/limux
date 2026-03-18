@@ -336,6 +336,15 @@ pub struct TerminalCallbacks {
     pub on_close: Box<dyn Fn()>,
     pub on_split_right: Box<dyn Fn()>,
     pub on_split_down: Box<dyn Fn()>,
+    /// Returns the workspace folder path for reset, if available.
+    pub get_reset_path: Box<dyn Fn() -> Option<String>>,
+}
+
+/// Send text to a surface as if typed (feeds into the pty).
+pub fn surface_send_text(surface: ghostty_surface_t, text: &str) {
+    unsafe {
+        ghostty_surface_text(surface, text.as_ptr() as *const c_char, text.len());
+    }
 }
 
 /// Create a new Ghostty-powered terminal widget.
@@ -704,6 +713,11 @@ pub fn create_terminal(
 // Context menu
 // ---------------------------------------------------------------------------
 
+/// Shell-escape a path by wrapping in single quotes.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn surface_action(surface: Option<ghostty_surface_t>, action: &str) {
     if let Some(surface) = surface {
         unsafe {
@@ -782,7 +796,18 @@ fn show_terminal_context_menu(
                     "Split Right" => (cb.on_split_right)(),
                     "Split Down" => (cb.on_split_down)(),
                     "Clear" => surface_action(surface, "clear_screen"),
-                    "Reset" => surface_action(surface, "reset"),
+                    "Reset" => {
+                        if let Some(s) = surface {
+                            // Send Ctrl+C to interrupt, then cd to workspace path and clear
+                            let path = (cb.get_reset_path)();
+                            let cmd = if let Some(p) = path {
+                                format!("\x03cd {} && clear\n", shell_escape(&p))
+                            } else {
+                                "\x03clear\n".to_string()
+                            };
+                            surface_send_text(s, &cmd);
+                        }
+                    }
                     _ => {}
                 }
             });
