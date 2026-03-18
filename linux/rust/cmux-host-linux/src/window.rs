@@ -1563,6 +1563,8 @@ fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
         };
 
         if let Some(sibling) = sibling {
+            // Clear focus before detaching children to avoid GTK focus tracking warnings
+            paned.set_focus_child(gtk::Widget::NONE);
             paned.set_start_child(gtk::Widget::NONE);
             paned.set_end_child(gtk::Widget::NONE);
 
