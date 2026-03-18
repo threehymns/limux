@@ -243,7 +243,55 @@ pub fn create_pane(callbacks: Rc<PaneCallbacks>, working_directory: Option<&str>
         });
     }
 
+    // Store internals on the outer widget so external code can cycle tabs
+    let internals = Rc::new(PaneInternals {
+        tab_state: tab_state.clone(),
+        tab_strip: tab_strip.clone(),
+        content_stack: content_stack.clone(),
+    });
+    unsafe {
+        outer.set_data("cmux-pane-internals", internals);
+    }
+
     outer
+}
+
+/// Cycle tabs in the focused pane. `delta`: 1 = next, -1 = prev.
+pub fn cycle_tab_in_pane(pane_widget: &gtk::Widget, delta: i32) {
+    let outer = pane_widget.downcast_ref::<gtk::Box>();
+    let outer = match outer {
+        Some(o) => o,
+        None => return,
+    };
+    let internals: Rc<PaneInternals> = unsafe {
+        match outer.data::<Rc<PaneInternals>>("cmux-pane-internals") {
+            Some(ptr) => ptr.as_ref().clone(),
+            None => return,
+        }
+    };
+
+    let ts = internals.tab_state.borrow();
+    let len = ts.tabs.len();
+    if len <= 1 {
+        return;
+    }
+
+    let active_idx = ts
+        .active_tab
+        .as_ref()
+        .and_then(|id| ts.tabs.iter().position(|e| e.id == *id))
+        .unwrap_or(0);
+
+    let new_idx = (active_idx as i32 + delta).rem_euclid(len as i32) as usize;
+    let new_id = ts.tabs[new_idx].id.clone();
+    drop(ts);
+
+    activate_tab(
+        &internals.tab_strip,
+        &internals.content_stack,
+        &internals.tab_state,
+        &new_id,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +311,13 @@ struct TabEntry {
 struct TabState {
     tabs: Vec<TabEntry>,
     active_tab: Option<String>,
+}
+
+/// Shared internals stored on the pane outer Box for external access.
+pub struct PaneInternals {
+    tab_state: Rc<std::cell::RefCell<TabState>>,
+    tab_strip: gtk::Box,
+    content_stack: gtk::Stack,
 }
 
 impl TabState {

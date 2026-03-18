@@ -503,6 +503,16 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
                 close_workspace(&state);
                 true
             }
+            // Ctrl+Shift+Left → prev tab
+            (true, true, gdk::Key::Left) => {
+                cycle_focused_pane_tab(&state, -1);
+                true
+            }
+            // Ctrl+Shift+Right → next tab
+            (true, true, gdk::Key::Right) => {
+                cycle_focused_pane_tab(&state, 1);
+                true
+            }
             // Ctrl+Shift+D → split down
             (true, true, gdk::Key::D | gdk::Key::d) => {
                 split_focused_pane(&state, gtk::Orientation::Vertical);
@@ -1643,6 +1653,12 @@ fn find_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
 fn split_focused_pane(state: &State, orientation: gtk::Orientation) {
     if let Some((ws_id, pane_widget)) = find_focused_pane(state) {
         split_pane(state, &ws_id, &pane_widget, orientation);
+    }
+}
+
+fn cycle_focused_pane_tab(state: &State, delta: i32) {
+    if let Some((_ws_id, pane_widget)) = find_focused_pane(state) {
+        pane::cycle_tab_in_pane(&pane_widget, delta);
     }
 }
 
