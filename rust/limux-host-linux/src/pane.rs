@@ -4,8 +4,9 @@
 //!
 //! All on one line. Tabs left-justified, icons right-justified.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use gtk::glib;
 use gtk::prelude::*;
@@ -13,6 +14,52 @@ use gtk4 as gtk;
 
 use crate::layout_state::{PaneState, TabContentState, TabState as SavedTabState};
 use crate::terminal::{self, TerminalCallbacks};
+
+// ---------------------------------------------------------------------------
+// Global pane registry (for cross-pane tab DnD)
+// ---------------------------------------------------------------------------
+
+fn next_pane_id() -> u32 {
+    static COUNTER: AtomicU32 = AtomicU32::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+thread_local! {
+    static PANE_REGISTRY: RefCell<std::collections::HashMap<u32, std::rc::Weak<PaneInternals>>>
+        = RefCell::new(std::collections::HashMap::new());
+}
+
+fn register_pane(id: u32, internals: &Rc<PaneInternals>) {
+    PANE_REGISTRY.with(|reg| {
+        reg.borrow_mut().insert(id, Rc::downgrade(internals));
+    });
+}
+
+fn unregister_pane(id: u32) {
+    PANE_REGISTRY.with(|reg| {
+        reg.borrow_mut().remove(&id);
+    });
+}
+
+fn lookup_pane_internals(id: u32) -> Option<Rc<PaneInternals>> {
+    PANE_REGISTRY.with(|reg| reg.borrow().get(&id)?.upgrade())
+}
+
+/// Find a pane widget by its pane_id. Returns the pane's outer Box widget.
+pub fn find_pane_widget_by_id(pane_id: u32) -> Option<gtk::Widget> {
+    lookup_pane_internals(pane_id).map(|i| i.pane_outer.clone().upcast())
+}
+
+/// Set the workspace-dragging flag on all registered panes.
+pub fn set_workspace_dragging_all(active: bool) {
+    PANE_REGISTRY.with(|reg| {
+        for weak in reg.borrow().values() {
+            if let Some(internals) = weak.upgrade() {
+                internals.workspace_dragging.set(active);
+            }
+        }
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -140,6 +187,14 @@ pub const PANE_CSS: &str = r#"
     min-height: 0;
     font-size: 12px;
 }
+.limux-tab-drop-indicator {
+    background-color: #5b9bd5;
+    min-width: 2px;
+    margin: 2px 0;
+}
+.limux-tab-overlay:drop(active) {
+    box-shadow: none;
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -168,12 +223,28 @@ pub fn create_pane(
         .build();
     header.add_css_class("limux-pane-header");
 
-    // Tab strip (left side, scrollable)
+    // Tab strip (left side)
     let tab_strip = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
         .hexpand(true)
         .build();
+
+    // Drop-insert indicator (thin vertical line shown during drag)
+    let drop_indicator = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    drop_indicator.add_css_class("limux-tab-drop-indicator");
+    drop_indicator.set_visible(false);
+    drop_indicator.set_valign(gtk::Align::Fill);
+    drop_indicator.set_halign(gtk::Align::Start);
+    drop_indicator.set_hexpand(false);
+
+    // Overlay so the indicator floats above the tab strip
+    let tab_overlay = gtk::Overlay::new();
+    tab_overlay.add_css_class("limux-tab-overlay");
+    tab_overlay.set_child(Some(&tab_strip));
+    tab_overlay.add_overlay(&drop_indicator);
+    tab_overlay.set_hexpand(true);
+    tab_overlay.set_clip_overlay(&drop_indicator, false);
 
     // Content stack for tab pages
     let content_stack = gtk::Stack::new();
@@ -199,7 +270,7 @@ pub fn create_pane(
     actions.append(&split_v_btn);
     actions.append(&close_btn);
 
-    header.append(&tab_strip);
+    header.append(&tab_overlay);
     header.append(&actions);
 
     outer.append(&header);
@@ -211,6 +282,92 @@ pub fn create_pane(
         active_tab: None,
     }));
 
+    // Flag set by workspace drag begin/end in window.rs
+    let workspace_dragging = Rc::new(Cell::new(false));
+
+    // Unified drop target on tab_overlay — determines insertion index from
+    // the x coordinate so tabs land *between* existing tabs, not on top.
+    // Also manages the drop-insert indicator widget.
+    {
+        let strip = tab_strip.clone();
+        let cs = content_stack.clone();
+        let state = tab_state.clone();
+        let cb = callbacks.clone();
+        let po = outer.clone();
+        let indicator = drop_indicator.clone();
+
+        let strip_drop = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+
+        // Position the indicator during drag motion
+        {
+            let state = state.clone();
+            let indicator = indicator.clone();
+            let ws_drag = workspace_dragging.clone();
+            strip_drop.connect_motion(move |_, _x, _y| {
+                if ws_drag.get() {
+                    return gtk::gdk::DragAction::empty();
+                }
+                position_indicator(&state, &indicator, _x);
+                gtk::gdk::DragAction::MOVE
+            });
+        }
+
+        // Hide indicator when drag leaves this pane
+        {
+            let indicator = indicator.clone();
+            strip_drop.connect_leave(move |_| {
+                indicator.set_visible(false);
+            });
+        }
+
+        // Perform the actual tab move on drop
+        strip_drop.connect_drop(move |_, value, x, _| {
+            let Ok(drag_data) = value.get::<String>() else {
+                indicator.set_visible(false);
+                return false;
+            };
+            let Some((src_pid, src_tid)) = drag_data.split_once(':') else {
+                indicator.set_visible(false);
+                return false;
+            };
+            let Ok(src_pane_id) = src_pid.parse::<u32>() else {
+                indicator.set_visible(false);
+                return false;
+            };
+
+            let target_pane_id = unsafe {
+                po.data::<Rc<PaneInternals>>("limux-pane-internals")
+                    .map(|ptr| ptr.as_ref().pane_id)
+                    .unwrap_or(0)
+            };
+
+            let insert_idx = find_insert_index(&state, x, src_pane_id == target_pane_id, &src_tid);
+
+            if src_pane_id == target_pane_id {
+                reorder_tab_to_index(&strip, &state, &cb, src_tid, insert_idx);
+            } else {
+                if let Some(src_internals) = lookup_pane_internals(src_pane_id) {
+                    move_tab_between_panes(
+                        &src_internals,
+                        &strip,
+                        &cs,
+                        &state,
+                        &cb,
+                        &po,
+                        src_tid,
+                        insert_idx,
+                    );
+                }
+            }
+
+            indicator.set_visible(false);
+            true
+        });
+        // Attach to the overlay so the drop target receives events
+        // even when the cursor is over a tab button.
+        tab_overlay.add_controller(strip_drop);
+    }
+
     if let Some(saved_state) = initial_state {
         restore_tabs_from_state(
             &tab_strip,
@@ -219,6 +376,7 @@ pub fn create_pane(
             &callbacks,
             working_directory,
             &outer,
+            &drop_indicator,
             saved_state,
         );
     } else {
@@ -229,6 +387,7 @@ pub fn create_pane(
             &callbacks,
             working_directory,
             &outer,
+            &drop_indicator,
             None,
         );
     }
@@ -241,9 +400,10 @@ pub fn create_pane(
         let cb = callbacks.clone();
         let ow = outer.clone();
         let wd = ws_wd.clone();
+        let di = drop_indicator.clone();
         new_term_btn.connect_clicked(move |_| {
             let dir = wd.borrow().clone();
-            add_terminal_tab_inner(&ts, &cs, &state, &cb, dir.as_deref(), &ow, None);
+            add_terminal_tab_inner(&ts, &cs, &state, &cb, dir.as_deref(), &ow, &di, None);
         });
     }
     {
@@ -252,8 +412,9 @@ pub fn create_pane(
         let state = tab_state.clone();
         let cb = callbacks.clone();
         let ow = outer.clone();
+        let di = drop_indicator.clone();
         new_browser_btn.connect_clicked(move |_| {
-            add_browser_tab_inner(&ts, &cs, &state, &cb, &ow, None);
+            add_browser_tab_inner(&ts, &cs, &state, &cb, &ow, &di, None);
         });
     }
     {
@@ -278,18 +439,28 @@ pub fn create_pane(
         });
     }
 
-    // Store internals on the outer widget so external code can cycle tabs
+    // Store internals on the outer widget so external code to cycle tabs
+    let pane_id = next_pane_id();
     let internals = Rc::new(PaneInternals {
+        pane_id,
         tab_state: tab_state.clone(),
         tab_strip: tab_strip.clone(),
         content_stack: content_stack.clone(),
         pane_outer: outer.clone(),
         callbacks: callbacks.clone(),
         working_directory: ws_wd.clone(),
+        drop_indicator: drop_indicator.clone(),
+        workspace_dragging: workspace_dragging.clone(),
     });
+    register_pane(pane_id, &internals);
     unsafe {
         outer.set_data("limux-pane-internals", internals);
     }
+
+    // Unregister from pane registry when this pane is destroyed
+    outer.connect_destroy(move |_| {
+        unregister_pane(pane_id);
+    });
 
     outer
 }
@@ -361,12 +532,15 @@ struct TabState {
 
 /// Shared internals stored on the pane outer Box for external access.
 pub struct PaneInternals {
+    pub pane_id: u32,
     tab_state: Rc<std::cell::RefCell<TabState>>,
     tab_strip: gtk::Box,
     content_stack: gtk::Stack,
     pane_outer: gtk::Box,
     callbacks: Rc<PaneCallbacks>,
     working_directory: Rc<std::cell::RefCell<Option<String>>>,
+    drop_indicator: gtk::Box,
+    pub workspace_dragging: Rc<Cell<bool>>,
 }
 
 impl TabState {
@@ -445,6 +619,7 @@ fn restore_tabs_from_state(
     callbacks: &Rc<PaneCallbacks>,
     working_directory: Option<&str>,
     pane_outer: &gtk::Box,
+    drop_indicator: &gtk::Box,
     saved_state: &PaneState,
 ) {
     if saved_state.tabs.is_empty() {
@@ -455,6 +630,7 @@ fn restore_tabs_from_state(
             callbacks,
             working_directory,
             pane_outer,
+            drop_indicator,
             None,
         );
         return;
@@ -469,6 +645,7 @@ fn restore_tabs_from_state(
                 callbacks,
                 cwd.as_deref().or(working_directory),
                 pane_outer,
+                drop_indicator,
                 Some(TerminalTabOptions {
                     id: Some(saved_tab.id.as_str()),
                     custom_name: saved_tab.custom_name.as_deref(),
@@ -482,6 +659,7 @@ fn restore_tabs_from_state(
                 tab_state,
                 callbacks,
                 pane_outer,
+                drop_indicator,
                 Some(BrowserTabOptions {
                     id: Some(saved_tab.id.as_str()),
                     custom_name: saved_tab.custom_name.as_deref(),
@@ -517,6 +695,7 @@ fn add_terminal_tab_inner(
     callbacks: &Rc<PaneCallbacks>,
     working_directory: Option<&str>,
     pane_outer: &gtk::Box,
+    drop_indicator: &gtk::Box,
     options: Option<TerminalTabOptions<'_>>,
 ) {
     let tab_id = options
@@ -533,6 +712,7 @@ fn add_terminal_tab_inner(
         tab_state,
         callbacks,
         pane_outer,
+        drop_indicator,
     );
 
     // Build Ghostty terminal callbacks for title/bell/close
@@ -621,6 +801,9 @@ fn add_terminal_tab_inner(
     let widget: gtk::Widget = term.clone().upcast();
     content_stack.add_named(&widget, Some(&tab_id));
 
+    // Append the tab button to the strip AFTER all setup is done
+    tab_strip.append(&tab_btn);
+
     {
         let mut ts = tab_state.borrow_mut();
         ts.tabs.push(TabEntry {
@@ -665,6 +848,7 @@ fn add_browser_tab_inner(
     tab_state: &Rc<RefCell<TabState>>,
     callbacks: &Rc<PaneCallbacks>,
     pane_outer: &gtk::Box,
+    drop_indicator: &gtk::Box,
     options: Option<BrowserTabOptions<'_>>,
 ) {
     let tab_id = options
@@ -690,9 +874,13 @@ fn add_browser_tab_inner(
         tab_state,
         callbacks,
         pane_outer,
+        drop_indicator,
     );
 
     content_stack.add_named(&widget, Some(&tab_id));
+
+    // Append the tab button to the strip AFTER all setup is done
+    tab_strip.append(&tab_btn);
 
     {
         let mut ts = tab_state.borrow_mut();
@@ -743,6 +931,7 @@ pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
             &internals.callbacks,
             dir.as_deref(),
             &internals.pane_outer,
+            &internals.drop_indicator,
             None,
         );
     }
@@ -757,6 +946,7 @@ pub fn add_browser_tab_to_pane(pane_widget: &gtk::Widget) {
             &internals.tab_state,
             &internals.callbacks,
             &internals.pane_outer,
+            &internals.drop_indicator,
             None,
         );
     }
@@ -819,6 +1009,33 @@ fn apply_pin_visuals(tab_button: &gtk::Box, pinned: bool) {
     }
 }
 
+/// Move a tab from a source pane to a target pane by widget reference.
+/// Used for cross-workspace tab dragging (sidebar drops).
+pub fn move_tab_to_pane(source_pane: &gtk::Widget, source_tab_id: &str, target_pane: &gtk::Widget) {
+    let Some(src_internals) = find_pane_internals(source_pane) else {
+        return;
+    };
+    let Some(tgt_internals) = find_pane_internals(target_pane) else {
+        return;
+    };
+    // Don't move to the same pane
+    if src_internals.pane_id == tgt_internals.pane_id {
+        return;
+    }
+    // Compute length BEFORE the call so the borrow is dropped
+    let target_len = tgt_internals.tab_state.borrow().tabs.len();
+    move_tab_between_panes(
+        &src_internals,
+        &tgt_internals.tab_strip,
+        &tgt_internals.content_stack,
+        &tgt_internals.tab_state,
+        &tgt_internals.callbacks,
+        &tgt_internals.pane_outer,
+        source_tab_id,
+        target_len,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tab button (label + close)
 // ---------------------------------------------------------------------------
@@ -831,6 +1048,7 @@ fn build_tab_button(
     tab_state: &Rc<RefCell<TabState>>,
     callbacks: &Rc<PaneCallbacks>,
     pane_outer: &gtk::Box,
+    drop_indicator: &gtk::Box,
 ) -> (gtk::Box, gtk::Label) {
     let pin_icon = gtk::Label::new(None);
     pin_icon.add_css_class("limux-pin-icon");
@@ -907,36 +1125,37 @@ fn build_tab_button(
     }
     tab_btn.add_controller(right_click);
 
-    // Drag source for reorder
+    // Drag source for reorder (includes pane_id for cross-pane DnD)
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
     {
         let tid = tab_id.to_string();
+        let po = pane_outer.clone();
+        let state = tab_state.clone();
+        let indicator_begin = drop_indicator.clone();
+        let indicator_end = drop_indicator.clone();
         drag_source.connect_prepare(move |_src, _x, _y| {
-            let val = glib::Value::from(&tid);
+            let pid = unsafe {
+                po.data::<Rc<PaneInternals>>("limux-pane-internals")
+                    .map(|ptr| ptr.as_ref().pane_id)
+                    .unwrap_or(0)
+            };
+            let val = glib::Value::from(&format!("{pid}:{tid}"));
             Some(gtk::gdk::ContentProvider::for_value(&val))
+        });
+        drag_source.connect_drag_begin(move |src, _drag| {
+            if let Some(w) = src.widget() {
+                let alloc = w.allocation();
+                position_indicator(&state, &indicator_begin, (alloc.x() + alloc.width()) as f64);
+                let icon = gtk::WidgetPaintable::new(Some(&w));
+                src.set_icon(Some(&icon), 0, 0);
+            }
+        });
+        drag_source.connect_drag_end(move |_, _, _| {
+            indicator_end.set_visible(false);
         });
     }
     tab_btn.add_controller(drag_source);
-
-    // Drop target for reorder
-    let drop_target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
-    {
-        let tid = tab_id.to_string();
-        let ts = tab_strip.clone();
-        let state = tab_state.clone();
-        let callbacks = callbacks.clone();
-        drop_target.connect_drop(move |_, value, _, _| {
-            if let Ok(source_id) = value.get::<String>() {
-                if source_id != tid {
-                    reorder_tab(&ts, &state, &source_id, &tid, &callbacks);
-                    return true;
-                }
-            }
-            false
-        });
-    }
-    tab_btn.add_controller(drop_target);
 
     // Close button click
     {
@@ -954,7 +1173,9 @@ fn build_tab_button(
         });
     }
 
-    tab_strip.append(&tab_btn);
+    // NOTE: Caller is responsible for appending tab_btn to the tab strip.
+    // This avoids triggering GTK signals while the caller may still hold
+    // RefCell borrows.
 
     (tab_btn, label)
 }
@@ -1128,28 +1349,89 @@ fn show_rename_dialog(
     }
 }
 
-fn reorder_tab(
+/// Position the drop-insert indicator at the nearest tab boundary for the
+/// given x coordinate.  The indicator is shown as a thin vertical line.
+fn position_indicator(tab_state: &Rc<std::cell::RefCell<TabState>>, indicator: &gtk::Box, x: f64) {
+    let ts = tab_state.borrow();
+    if ts.tabs.is_empty() {
+        indicator.set_visible(false);
+        return;
+    }
+
+    // Find the tab boundary closest to x
+    let mut pos: i32 = 0;
+    for entry in ts.tabs.iter() {
+        let alloc = entry.tab_button.allocation();
+        let left = alloc.x();
+        let right = left + alloc.width();
+        let mid = left + alloc.width() / 2;
+
+        if x < mid as f64 {
+            pos = left;
+            break;
+        }
+        pos = right;
+    }
+
+    drop(ts);
+
+    indicator.set_margin_start(pos);
+    indicator.set_visible(true);
+}
+
+/// Compute the insertion index for a tab drop at the given x coordinate.
+/// Walks tab buttons and finds the first one whose midpoint is past `x`,
+/// then returns that index (i.e. "insert before this tab").  If the drop is
+/// past every tab, returns the length (append at end).
+///
+/// For same-pane reorders the source tab is excluded from the midpoint
+/// comparison so it doesn't interfere with its own drop.
+fn find_insert_index(
+    tab_state: &Rc<std::cell::RefCell<TabState>>,
+    x: f64,
+    same_pane: bool,
+    source_tab_id: &str,
+) -> usize {
+    let ts = tab_state.borrow();
+    for (i, entry) in ts.tabs.iter().enumerate() {
+        if same_pane && entry.id == source_tab_id {
+            continue;
+        }
+        let alloc = entry.tab_button.allocation();
+        let mid = alloc.x() as f64 + alloc.width() as f64 / 2.0;
+        if x < mid {
+            drop(ts);
+            return i;
+        }
+    }
+    let result = ts.tabs.len();
+    drop(ts);
+    result
+}
+
+/// Reorder a tab within the same pane to the given insertion index.
+fn reorder_tab_to_index(
     tab_strip: &gtk::Box,
     tab_state: &Rc<RefCell<TabState>>,
-    source_id: &str,
-    target_id: &str,
     callbacks: &Rc<PaneCallbacks>,
+    source_id: &str,
+    insert_idx: usize,
 ) {
     let mut ts = tab_state.borrow_mut();
-
     let Some(src_idx) = ts.tabs.iter().position(|e| e.id == source_id) else {
         return;
     };
-    let Some(tgt_idx) = ts.tabs.iter().position(|e| e.id == target_id) else {
-        return;
-    };
 
-    // Move the tab entry
     let entry = ts.tabs.remove(src_idx);
-    ts.tabs.insert(tgt_idx, entry);
+    // After removal, if the source was before the insertion point, the
+    // effective target shifted down by one.
+    let adjusted = if src_idx < insert_idx {
+        insert_idx - 1
+    } else {
+        insert_idx
+    };
+    ts.tabs.insert(adjusted, entry);
 
-    // Rebuild tab strip order
-    // Remove all tab buttons then re-add in order
     let buttons: Vec<gtk::Box> = ts.tabs.iter().map(|e| e.tab_button.clone()).collect();
     drop(ts);
 
@@ -1159,7 +1441,161 @@ fn reorder_tab(
     for btn in &buttons {
         tab_strip.append(btn);
     }
-    (callbacks.on_state_changed)();
+    let cb = callbacks.clone();
+    glib::idle_add_local_once(move || {
+        (cb.on_state_changed)();
+    });
+}
+
+/// Move a tab from one pane to another (for cross-pane drag-and-drop).
+/// `insert_idx`: absolute index in the target pane's tab list.
+fn move_tab_between_panes(
+    src_internals: &Rc<PaneInternals>,
+    target_tab_strip: &gtk::Box,
+    target_content_stack: &gtk::Stack,
+    target_tab_state: &Rc<std::cell::RefCell<TabState>>,
+    target_callbacks: &Rc<PaneCallbacks>,
+    target_pane_outer: &gtk::Box,
+    src_tab_id: &str,
+    insert_idx: usize,
+) {
+    // ---- Phase 1: data-only operations on the source pane ----
+
+    let (mut entry, content_widget, src_is_empty, src_new_active) = {
+        let mut src_ts = src_internals.tab_state.borrow_mut();
+        let Some(src_idx) = src_ts.tabs.iter().position(|e| e.id == src_tab_id) else {
+            return;
+        };
+        let entry = src_ts.tabs.remove(src_idx);
+
+        let src_was_active = src_ts.active_tab.as_deref() == Some(src_tab_id);
+        let src_is_empty = src_ts.tabs.is_empty();
+        let src_new_active = if src_was_active && !src_is_empty {
+            let new_idx = src_idx.min(src_ts.tabs.len() - 1);
+            Some(src_ts.tabs[new_idx].id.clone())
+        } else {
+            None
+        };
+
+        let content = entry.content.clone();
+        (entry, content, src_is_empty, src_new_active)
+    };
+
+    // Remove content from source stack synchronously (required before the
+    // target-side idle callback can add it — a widget can't have two parents).
+    src_internals.content_stack.remove(&content_widget);
+
+    // ---- Phase 2: data-only operations on the target pane ----
+
+    // Save original source tab button BEFORE replacing it with a placeholder.
+    let src_tab_btn = entry.tab_button.clone();
+
+    let new_tab_id = next_tab_id();
+    entry.id = new_tab_id.clone();
+    // Placeholder — the real button is created in the idle callback.
+    entry.tab_button = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    entry.content = content_widget.clone();
+
+    {
+        let mut tgt_ts = target_tab_state.borrow_mut();
+        let clamped = insert_idx.min(tgt_ts.tabs.len());
+        tgt_ts.tabs.insert(clamped, entry);
+    }
+
+    // ---- Phase 3: ALL UI work deferred to idle to avoid RefCell conflicts ----
+
+    let target_strip = target_tab_strip.clone();
+    let target_cs = target_content_stack.clone();
+    let target_state = target_tab_state.clone();
+    let target_cb = target_callbacks.clone();
+    let target_outer = target_pane_outer.clone();
+    let content = content_widget;
+    let tid = new_tab_id;
+
+    // Clone source pane variables before the single idle callback
+    let src_strip = src_internals.tab_strip.clone();
+    let src_cs = src_internals.content_stack.clone();
+    let src_state = src_internals.tab_state.clone();
+    let src_callbacks = src_internals.callbacks.clone();
+    let src_outer = src_internals.pane_outer.clone();
+
+    glib::idle_add_local_once(move || {
+        // Look up the indicator for the target pane
+        let target_indicator = find_pane_internals(&target_outer.clone().upcast())
+            .map(|i| i.drop_indicator.clone())
+            .unwrap_or_else(|| gtk::Box::new(gtk::Orientation::Vertical, 0));
+
+        // Get the title from the stored entry
+        let title = {
+            let ts = target_state.borrow();
+            ts.tabs
+                .iter()
+                .find(|e| e.id == tid)
+                .map(|e| e.title_label.label().to_string())
+                .unwrap_or_else(|| "Terminal".to_string())
+        };
+
+        // Create the real tab button (this may trigger GTK signals — safe now)
+        let (new_tab_btn, new_title_label) = build_tab_button(
+            &title,
+            &tid,
+            &target_strip,
+            &target_cs,
+            &target_state,
+            &target_cb,
+            &target_outer,
+            &target_indicator,
+        );
+
+        // Add the content widget to the stack
+        target_cs.add_named(&content, Some(&tid));
+
+        // Update the stored entry with the real button, collecting old placeholder
+        let placeholder = {
+            let mut ts = target_state.borrow_mut();
+            if let Some(entry) = ts.tabs.iter_mut().find(|e| e.id == tid) {
+                let old = entry.tab_button.clone();
+                entry.tab_button = new_tab_btn;
+                entry.title_label = new_title_label;
+                old
+            } else {
+                return;
+            }
+        };
+
+        // Remove the placeholder if it's actually in the strip
+        if placeholder.parent().is_some() {
+            target_strip.remove(&placeholder);
+        }
+
+        // Rebuild strip order: remove all existing buttons, then re-add in order
+        let buttons: Vec<gtk::Box> = target_state
+            .borrow()
+            .tabs
+            .iter()
+            .map(|e| e.tab_button.clone())
+            .collect();
+        for btn in &buttons {
+            if btn.parent().is_some() {
+                target_strip.remove(btn);
+            }
+        }
+        for btn in &buttons {
+            target_strip.append(btn);
+        }
+
+        activate_tab(&target_strip, &target_cs, &target_state, &tid);
+
+        // Source pane cleanup — deferred to avoid RefCell conflicts with GTK
+        // callbacks that may fire during widget removal (click/drag handlers).
+        // Runs after target setup to ensure pane is fully ready before cleanup.
+        src_strip.remove(&src_tab_btn);
+        if src_is_empty {
+            (src_callbacks.on_empty)(&src_outer.upcast());
+        } else if let Some(new_id) = src_new_active {
+            activate_tab(&src_strip, &src_cs, &src_state, &new_id);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,7 +1623,10 @@ fn activate_tab(
         }
     }
 
-    content_stack.set_visible_child_name(tab_id);
+    // Only switch if the stack already has this child
+    if content_stack.child_by_name(tab_id).is_some() {
+        content_stack.set_visible_child_name(tab_id);
+    }
 
     // Focus the content — only grab focus on directly focusable widgets (terminals).
     // For containers (browser vbox), focus the first focusable child instead.

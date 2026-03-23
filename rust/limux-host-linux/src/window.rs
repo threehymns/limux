@@ -57,6 +57,8 @@ struct AppState {
     sidebar_expanded_width: i32,
     persistence_suspended: bool,
     save_queued: bool,
+    /// The workspace ID currently being dragged, if any.
+    workspace_dragging: Option<String>,
 }
 
 impl AppState {
@@ -446,16 +448,19 @@ row:selected .limux-ws-star-btn {
     font-weight: 700;
 }
 .limux-drop-above .limux-sidebar-row-box {
-    border-top: 2px solid #0091FF;
-    border-top-left-radius: 0;
-    border-top-right-radius: 0;
-    padding-top: 4px;
+    border-radius: 0;
+    box-shadow: 0 -2px 0 0 #0091FF;
 }
 .limux-drop-below .limux-sidebar-row-box {
-    border-bottom: 2px solid #0091FF;
-    border-bottom-left-radius: 0;
-    border-bottom-right-radius: 0;
-    padding-bottom: 4px;
+    border-radius: 0;
+    box-shadow: 0 2px 0 0 #0091FF;
+}
+.limux-tab-drop-target {
+    background-color: rgba(0, 145, 255, 0.18);
+    border-radius: 8px;
+}
+.limux-sidebar row:drop(active) {
+    box-shadow: none;
 }
 .limux-sidebar-title {
     color: rgba(255, 255, 255, 0.5);
@@ -709,6 +714,7 @@ pub fn build_window(app: &adw::Application) {
         sidebar_expanded_width: SIDEBAR_WIDTH,
         persistence_suspended: false,
         save_queued: false,
+        workspace_dragging: None,
     }));
 
     {
@@ -1322,6 +1328,41 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
     }
 }
 
+/// Handle a tab being dropped onto a workspace sidebar row.
+/// Moves the tab from its source pane to a pane in the target workspace.
+fn handle_tab_drop_to_workspace(
+    state: &State,
+    target_ws_id: &str,
+    pane_id_str: &str,
+    tab_id: &str,
+) -> bool {
+    let Ok(src_pane_id) = pane_id_str.parse::<u32>() else {
+        return false;
+    };
+
+    // Look up the source pane widget
+    let Some(src_widget) = pane::find_pane_widget_by_id(src_pane_id) else {
+        return false;
+    };
+
+    let s = state.borrow();
+
+    // Find the target workspace
+    let Some(target_ws) = s.workspaces.iter().find(|w| w.id == target_ws_id) else {
+        return false;
+    };
+
+    // Find a leaf pane in the target workspace to receive the tab
+    let target_pane = find_leaf_pane(&target_ws.root, gtk::Orientation::Horizontal, true);
+
+    drop(s);
+
+    // Move the tab
+    pane::move_tab_to_pane(&src_widget, tab_id, &target_pane);
+
+    true
+}
+
 fn reorder_workspace_by_id(
     state: &State,
     source_id: &str,
@@ -1483,61 +1524,148 @@ fn install_workspace_row_interactions(
     }
     {
         let state = state.clone();
-        drag_source.connect_drag_begin(move |_, _| {
-            let s = state.borrow();
+        let ws_row = row.clone();
+        let ws_id = workspace_id.to_string();
+        drag_source.connect_drag_begin(move |src, _drag| {
+            let mut s = state.borrow_mut();
+            s.workspace_dragging = Some(ws_id.clone());
             s.new_ws_btn.set_label("\u{1F5D1}\u{FE0E}");
             s.new_ws_btn.add_css_class("limux-sidebar-btn-trash");
+            drop(s);
+            pane::set_workspace_dragging_all(true);
+            let icon = gtk::WidgetPaintable::new(Some(&ws_row));
+            src.set_icon(Some(&icon), 0, 0);
         });
     }
     {
         let state = state.clone();
         drag_source.connect_drag_end(move |_, _, _| {
-            let s = state.borrow();
+            let mut s = state.borrow_mut();
+            s.workspace_dragging = None;
             s.new_ws_btn.set_label("New Workspace");
             s.new_ws_btn.remove_css_class("limux-sidebar-btn-trash");
             s.new_ws_btn
                 .remove_css_class("limux-sidebar-btn-trash-hover");
+            pane::set_workspace_dragging_all(false);
         });
     }
     row.add_controller(drag_source);
 
-    // Drop target for sidebar reordering with visual feedback.
+    // Drop target for sidebar reordering AND tab drops with visual feedback.
     let drop_target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
     drop_target.set_preload(true);
+    // Shared state for hover-to-switch: holding a dragged item over a workspace
+    // row for 500ms switches to that workspace so the user can drop into a pane.
+    let hover_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     {
         let r = row.clone();
-        drop_target.connect_motion(move |_, _x, y| {
+        let timer = hover_timer.clone();
+        let state_for_hover = state.clone();
+        let target_ws_id = workspace_id.to_string();
+        let state_for_motion = state.clone();
+        drop_target.connect_motion(move |_dt, _x, y| {
             let h = r.height() as f64;
             r.remove_css_class("limux-drop-above");
             r.remove_css_class("limux-drop-below");
-            if y < h / 2.0 {
-                r.add_css_class("limux-drop-above");
-            } else {
-                r.add_css_class("limux-drop-below");
+            r.remove_css_class("limux-tab-drop-target");
+
+            let s = state_for_motion.borrow();
+            let dragged_ws_id = s.workspace_dragging.clone();
+            drop(s);
+
+            match dragged_ws_id {
+                Some(ref src_id) if *src_id != target_ws_id => {
+                    // Workspace drag over a different row — show reorder line.
+                    if y < h / 2.0 {
+                        r.add_css_class("limux-drop-above");
+                    } else {
+                        r.add_css_class("limux-drop-below");
+                    }
+                }
+                None => {
+                    // Tab drag — show background highlight.
+                    r.add_css_class("limux-tab-drop-target");
+                }
+                _ => {
+                    // Workspace drag over its own source row — no indicator.
+                }
             }
+
+            // Start hover-to-switch timer (if not already running).
+            if timer.borrow().is_none() {
+                let t = timer.clone();
+                let s = state_for_hover.clone();
+                let ws_id = target_ws_id.clone();
+                let source = glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(500),
+                    move || {
+                        *t.borrow_mut() = None;
+                        let (idx, sidebar_list, sidebar_row) = {
+                            let app = s.borrow();
+                            let idx = app.workspaces.iter().position(|w| w.id == ws_id);
+                            let ws = idx.and_then(|i| app.workspaces.get(i));
+                            (
+                                idx,
+                                app.sidebar_list.clone(),
+                                ws.map(|w| w.sidebar_row.clone()),
+                            )
+                        };
+                        if let Some(idx) = idx {
+                            switch_workspace(&s, idx);
+                        }
+                        if let Some(row) = sidebar_row {
+                            sidebar_list.select_row(Some(&row));
+                        }
+                    },
+                );
+                *timer.borrow_mut() = Some(source);
+            }
+
             gtk::gdk::DragAction::MOVE
         });
     }
     {
         let r = row.clone();
+        let timer = hover_timer.clone();
         drop_target.connect_leave(move |_| {
             r.remove_css_class("limux-drop-above");
             r.remove_css_class("limux-drop-below");
+            r.remove_css_class("limux-tab-drop-target");
+            if let Some(source) = timer.borrow_mut().take() {
+                source.remove();
+            }
         });
     }
     {
         let state = state.clone();
         let target_workspace_id = workspace_id.to_string();
         let r = row.clone();
+        let timer = hover_timer.clone();
         drop_target.connect_drop(move |_dt, value, _, y| {
             r.remove_css_class("limux-drop-above");
             r.remove_css_class("limux-drop-below");
-            let drop_below = y >= r.height() as f64 / 2.0;
-            if let Ok(source_workspace_id) = value.get::<String>() {
-                if source_workspace_id != target_workspace_id {
+            r.remove_css_class("limux-tab-drop-target");
+            if let Some(source) = timer.borrow_mut().take() {
+                source.remove();
+            }
+            if let Ok(drag_data) = value.get::<String>() {
+                // Tab drag format: "pane_id:tab_id"
+                if let Some((pane_id_str, tab_id)) = drag_data.split_once(':') {
+                    if pane_id_str.parse::<u32>().is_ok() {
+                        return handle_tab_drop_to_workspace(
+                            &state,
+                            &target_workspace_id,
+                            pane_id_str,
+                            tab_id,
+                        );
+                    }
+                }
+                // Workspace reorder format: plain workspace_id
+                let drop_below = y >= r.height() as f64 / 2.0;
+                if drag_data != target_workspace_id {
                     return reorder_workspace_by_id(
                         &state,
-                        &source_workspace_id,
+                        &drag_data,
                         &target_workspace_id,
                         drop_below,
                     );
@@ -1763,29 +1891,48 @@ fn close_workspace_by_id(state: &State, id: &str) {
 }
 
 fn switch_workspace(state: &State, idx: usize) {
-    let mut s = state.borrow_mut();
-    if idx >= s.workspaces.len() || idx == s.active_idx {
-        return;
-    }
-    s.active_idx = idx;
-    let stack_name = format!("ws-{}", s.workspaces[idx].id);
-    s.stack.set_visible_child_name(&stack_name);
+    let (stack, stack_name, unread_clear) = {
+        let mut s = state.borrow_mut();
+        if idx >= s.workspaces.len() || idx == s.active_idx {
+            return;
+        }
+        s.active_idx = idx;
+        let stack_name = format!("ws-{}", s.workspaces[idx].id);
 
-    // Clear unread
-    let ws = &mut s.workspaces[idx];
-    if ws.unread {
-        ws.unread = false;
-        ws.notify_dot.remove_css_class("limux-notify-dot");
-        ws.notify_dot.add_css_class("limux-notify-dot-hidden");
-        ws.notify_label.remove_css_class("limux-notify-msg-unread");
-        ws.notify_label.add_css_class("limux-notify-msg");
-        ws.notify_label.set_visible(false);
-        // Remove glow pulse from sidebar row
-        if let Some(row_box) = ws.sidebar_row.child() {
+        // Clear unread
+        let unread_clear = {
+            let ws = &mut s.workspaces[idx];
+            if ws.unread {
+                ws.unread = false;
+                Some((
+                    ws.notify_dot.clone(),
+                    ws.notify_label.clone(),
+                    ws.sidebar_row.clone(),
+                ))
+            } else {
+                None
+            }
+        };
+
+        (s.stack.clone(), stack_name, unread_clear)
+    };
+
+    // GTK side effects outside the RefCell borrow to avoid re-entrant borrows
+    // when set_visible_child_name triggers connect_map -> set_position ->
+    // position_notify -> request_session_save.
+    stack.set_visible_child_name(&stack_name);
+
+    if let Some((notify_dot, notify_label, sidebar_row)) = unread_clear {
+        notify_dot.remove_css_class("limux-notify-dot");
+        notify_dot.add_css_class("limux-notify-dot-hidden");
+        notify_label.remove_css_class("limux-notify-msg-unread");
+        notify_label.add_css_class("limux-notify-msg");
+        notify_label.set_visible(false);
+        if let Some(row_box) = sidebar_row.child() {
             row_box.remove_css_class("limux-sidebar-row-unread");
         }
     }
-    drop(s);
+
     request_session_save(state);
 }
 
