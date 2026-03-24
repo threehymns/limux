@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -1557,13 +1557,16 @@ fn install_workspace_row_interactions(
     // Shared state for hover-to-switch: holding a dragged item over a workspace
     // row for 500ms switches to that workspace so the user can drop into a pane.
     let hover_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let drop_handled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     {
         let r = row.clone();
         let timer = hover_timer.clone();
         let state_for_hover = state.clone();
         let target_ws_id = workspace_id.to_string();
         let state_for_motion = state.clone();
+        let dh_for_timer = drop_handled.clone();
         drop_target.connect_motion(move |_dt, _x, y| {
+            dh_for_timer.set(false);
             let h = r.height() as f64;
             r.remove_css_class("limux-drop-above");
             r.remove_css_class("limux-drop-below");
@@ -1596,10 +1599,14 @@ fn install_workspace_row_interactions(
                 let t = timer.clone();
                 let s = state_for_hover.clone();
                 let ws_id = target_ws_id.clone();
+                let dh = dh_for_timer.clone();
                 let source = glib::timeout_add_local_once(
                     std::time::Duration::from_millis(500),
                     move || {
                         *t.borrow_mut() = None;
+                        if dh.get() {
+                            return;
+                        }
                         let (idx, sidebar_list, sidebar_row) = {
                             let app = s.borrow();
                             let idx = app.workspaces.iter().position(|w| w.id == ws_id);
@@ -1641,7 +1648,9 @@ fn install_workspace_row_interactions(
         let target_workspace_id = workspace_id.to_string();
         let r = row.clone();
         let timer = hover_timer.clone();
+        let dh = drop_handled.clone();
         drop_target.connect_drop(move |_dt, value, _, y| {
+            dh.set(true);
             r.remove_css_class("limux-drop-above");
             r.remove_css_class("limux-drop-below");
             r.remove_css_class("limux-tab-drop-target");
