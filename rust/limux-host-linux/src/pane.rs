@@ -894,7 +894,6 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
     })
 }
 
-#[allow(dead_code)]
 fn find_pane_internals(pane_widget: &gtk::Widget) -> Option<Rc<PaneInternals>> {
     let outer = pane_widget.downcast_ref::<gtk::Box>()?;
     unsafe {
@@ -1272,8 +1271,6 @@ fn position_indicator(tab_state: &Rc<std::cell::RefCell<TabState>>, indicator: &
         pos = right;
     }
 
-    drop(ts);
-
     indicator.set_margin_start(pos);
     indicator.set_visible(true);
 }
@@ -1299,13 +1296,10 @@ fn find_insert_index(
         let alloc = entry.tab_button.allocation();
         let mid = alloc.x() as f64 + alloc.width() as f64 / 2.0;
         if x < mid {
-            drop(ts);
             return i;
         }
     }
-    let result = ts.tabs.len();
-    drop(ts);
-    result
+    ts.tabs.len()
 }
 
 /// Reorder a tab within the same pane to the given insertion index.
@@ -1399,35 +1393,25 @@ fn move_tab_between_panes(
 
     // ---- Phase 3: ALL UI work deferred to idle to avoid RefCell conflicts ----
 
-    let target_strip = tgt_internals.tab_strip.clone();
-    let target_cs = tgt_internals.content_stack.clone();
-    let target_state = tgt_internals.tab_state.clone();
-    let target_cb = tgt_internals.callbacks.clone();
-    let target_outer = tgt_internals.pane_outer.clone();
     let content = content_widget;
     let tid = new_tab_id;
 
-    // Clone source pane variables before the single idle callback
+    // Clone source pane variables for the idle callback
     let src_strip = src_internals.tab_strip.clone();
     let src_cs = src_internals.content_stack.clone();
     let src_state = src_internals.tab_state.clone();
     let src_callbacks = src_internals.callbacks.clone();
     let src_outer = src_internals.pane_outer.clone();
 
-    // Build an owned PaneInternals for the target (idle callback requires 'static)
-    let tgt = Rc::new(PaneInternals {
-        pane_id: tgt_internals.pane_id,
-        tab_strip: target_strip,
-        content_stack: target_cs,
-        tab_state: target_state,
-        callbacks: target_cb,
-        pane_outer: target_outer,
-        working_directory: tgt_internals.working_directory.clone(),
-        drop_indicator: tgt_internals.drop_indicator.clone(),
-        workspace_dragging: tgt_internals.workspace_dragging.clone(),
-    });
+    // Retrieve the real target PaneInternals from widget data so the idle
+    // callback shares the same Rc allocations (drop_indicator, etc.) as the
+    // actual target pane.
+    let tgt_pane_outer = tgt_internals.pane_outer.clone();
 
     glib::idle_add_local_once(move || {
+        let Some(tgt) = find_pane_internals(&tgt_pane_outer.upcast()) else {
+            return;
+        };
         // Get the title from the stored entry
         let title = {
             let ts = tgt.tab_state.borrow();
