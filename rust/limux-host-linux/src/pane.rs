@@ -543,13 +543,13 @@ pub fn install_content_drop_overlay(pane_outer: &gtk::Box) {
         while let Some(w) = child {
             child = w.next_sibling();
             if w.has_css_class("limux-browser") {
-                // Third child of the browser vbox is the webview (nav_bar, search_bar, webview)
-                if let Some(webview) = w
-                    .first_child()
-                    .and_then(|c| c.next_sibling())
-                    .and_then(|c| c.next_sibling())
-                {
-                    webview.set_can_target(!dragging);
+                let mut browser_child = w.first_child();
+                while let Some(bc) = browser_child {
+                    browser_child = bc.next_sibling();
+                    if bc.has_css_class("limux-browser-webview") {
+                        bc.set_can_target(!dragging);
+                        break;
+                    }
                 }
             }
         }
@@ -2580,6 +2580,7 @@ fn create_browser_widget(
         .hexpand(true)
         .vexpand(true)
         .build();
+    webview.add_css_class("limux-browser-webview");
 
     // Set permissive settings
     if let Some(settings) = webkit6::prelude::WebViewExt::settings(&webview) {
