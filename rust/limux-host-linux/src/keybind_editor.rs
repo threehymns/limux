@@ -225,8 +225,7 @@ pub fn build_keybind_editor(
             let errors = errors.clone();
             let rows = rows.clone();
             let state = state.clone();
-            let outer = outer.clone();
-            binding_button.connect_clicked(move |_| {
+            binding_button.connect_clicked(move |button| {
                 *listening.borrow_mut() = Some(shortcut_id);
                 errors.borrow_mut().remove(&shortcut_id);
                 refresh_rows(
@@ -235,7 +234,7 @@ pub fn build_keybind_editor(
                     *listening.borrow(),
                     &errors.borrow(),
                 );
-                outer.grab_focus();
+                button.grab_focus();
             });
         }
     }
@@ -299,6 +298,16 @@ pub fn build_keybind_editor(
             gtk::glib::Propagation::Stop
         });
         outer.add_controller(key_controller);
+    }
+
+    {
+        let outer = outer.clone();
+        popover.connect_map(move |_| {
+            let outer = outer.clone();
+            gtk::glib::idle_add_local_once(move || {
+                outer.grab_focus();
+            });
+        });
     }
 
     refresh_rows(&rows.borrow(), shortcuts, None, &HashMap::new());
