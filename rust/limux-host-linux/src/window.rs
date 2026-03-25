@@ -296,7 +296,7 @@ fn build_workspace_root(
 ) -> gtk::Widget {
     match layout {
         Some(layout) => build_layout_widget(state, ws_id, working_directory, layout),
-        None => create_pane_for_workspace(state, ws_id, working_directory, None).upcast(),
+        None => create_pane_for_workspace(state, ws_id, working_directory, None, false).upcast(),
     }
 }
 
@@ -308,7 +308,8 @@ fn build_layout_widget(
 ) -> gtk::Widget {
     match layout {
         LayoutNodeState::Pane(pane_state) => {
-            create_pane_for_workspace(state, ws_id, working_directory, Some(pane_state)).upcast()
+            create_pane_for_workspace(state, ws_id, working_directory, Some(pane_state), false)
+                .upcast()
         }
         LayoutNodeState::Split(split_state) => {
             let orientation = match split_state.orientation {
@@ -1893,6 +1894,7 @@ fn create_pane_for_workspace(
     ws_id: &str,
     working_directory: Option<&str>,
     initial_state: Option<&PaneState>,
+    skip_default_tab: bool,
 ) -> gtk::Box {
     let state_for_split = state.clone();
     let state_for_close = state.clone();
@@ -1904,6 +1906,9 @@ fn create_pane_for_workspace(
     let ws_id_bell = ws_id.to_string();
     let ws_id_pwd = ws_id.to_string();
     let ws_id_empty = ws_id.to_string();
+
+    let state_for_split_tab = state.clone();
+    let ws_id_split_tab = ws_id.to_string();
 
     let callbacks = Rc::new(PaneCallbacks {
         on_split: Box::new(move |pane_widget, orientation| {
@@ -1938,9 +1943,71 @@ fn create_pane_for_workspace(
             let state = state.clone();
             move || request_session_save(&state)
         }),
+        on_split_with_tab: Box::new(
+            move |source_pane, pane_widget, orientation, tab_id, new_pane_first| {
+                handle_split_with_tab(
+                    &state_for_split_tab,
+                    &ws_id_split_tab,
+                    source_pane,
+                    pane_widget,
+                    orientation,
+                    &tab_id,
+                    new_pane_first,
+                );
+            },
+        ),
     });
 
-    pane::create_pane(callbacks, working_directory, initial_state)
+    let pane = pane::create_pane(
+        callbacks,
+        working_directory,
+        initial_state,
+        skip_default_tab,
+    );
+
+    // Add content-area drop zone overlay for tab drag-and-drop
+    pane::install_content_drop_overlay(&pane);
+
+    pane
+}
+
+fn handle_split_with_tab(
+    state: &State,
+    ws_id: &str,
+    source_pane: &gtk::Widget,
+    pane_widget: &gtk::Widget,
+    orientation: gtk::Orientation,
+    tab_id: &str,
+    new_pane_first: bool,
+) {
+    let src_pane = source_pane.clone();
+    let tgt_pane = pane_widget.clone();
+    let tab_id_owned = tab_id.to_string();
+
+    // Split the pane — empty=true skips the default terminal tab
+    split_pane_inner(state, ws_id, pane_widget, orientation, true, new_pane_first);
+
+    // Move the dragged tab into the new pane
+    let state_for_save = state.clone();
+    glib::idle_add_local_once(move || {
+        let target_paned = match tgt_pane
+            .parent()
+            .and_then(|p| p.downcast::<gtk::Paned>().ok())
+        {
+            Some(p) => p,
+            None => return,
+        };
+        let target = if new_pane_first {
+            target_paned.start_child()
+        } else {
+            target_paned.end_child()
+        };
+        let Some(target) = target else {
+            return;
+        };
+        pane::move_tab_to_pane(&src_pane, &tab_id_owned, &target);
+        request_session_save(&state_for_save);
+    });
 }
 
 fn close_workspace(state: &State) {
@@ -2168,6 +2235,17 @@ fn split_pane(
     pane_widget: &gtk::Widget,
     orientation: gtk::Orientation,
 ) {
+    split_pane_inner(state, ws_id, pane_widget, orientation, false, false);
+}
+
+fn split_pane_inner(
+    state: &State,
+    ws_id: &str,
+    pane_widget: &gtk::Widget,
+    orientation: gtk::Orientation,
+    empty: bool,
+    new_pane_first: bool,
+) {
     // Use the workspace's folder_path (or current cwd) for the new pane
     let wd = {
         let s = state.borrow();
@@ -2176,7 +2254,7 @@ fn split_pane(
             .find(|w| w.id == ws_id)
             .and_then(|ws| ws.folder_path.clone().or_else(|| ws.cwd.borrow().clone()))
     };
-    let new_pane = create_pane_for_workspace(state, ws_id, wd.as_deref(), None);
+    let new_pane = create_pane_for_workspace(state, ws_id, wd.as_deref(), None, empty);
 
     let parent = pane_widget.parent();
 
@@ -2212,8 +2290,13 @@ fn split_pane(
         }
     }
 
-    new_paned.set_start_child(Some(pane_widget));
-    new_paned.set_end_child(Some(&new_pane));
+    if new_pane_first {
+        new_paned.set_start_child(Some(&new_pane));
+        new_paned.set_end_child(Some(pane_widget));
+    } else {
+        new_paned.set_start_child(Some(pane_widget));
+        new_paned.set_end_child(Some(&new_pane));
+    }
 
     // 50% split after layout
     {

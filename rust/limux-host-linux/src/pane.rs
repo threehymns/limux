@@ -32,7 +32,8 @@ type TabDragCallback = dyn Fn(bool);
 
 thread_local! {
     static TAB_DRAGGING: Cell<bool> = const { Cell::new(false) };
-    static TAB_DRAG_LISTENERS: RefCell<Vec<Box<TabDragCallback>>> = RefCell::new(Vec::new());
+    static TAB_DRAG_LISTENERS: RefCell<std::collections::HashMap<usize, Box<TabDragCallback>>> = RefCell::new(std::collections::HashMap::new());
+    static TAB_DRAG_NEXT_ID: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Returns true when a tab drag is in progress.
@@ -42,16 +43,30 @@ pub fn is_tab_dragging() -> bool {
 
 /// Register a callback invoked when tab drag state changes.
 /// Receives `true` when a drag begins, `false` when it ends.
-pub fn on_tab_drag_change(callback: impl Fn(bool) + 'static) {
+/// Returns a listener ID (pass to `remove_tab_drag_listener` to unregister).
+pub fn on_tab_drag_change(callback: impl Fn(bool) + 'static) -> usize {
     TAB_DRAG_LISTENERS.with(|listeners| {
-        listeners.borrow_mut().push(Box::new(callback));
+        let id = TAB_DRAG_NEXT_ID.with(|n| {
+            let v = n.get();
+            n.set(v + 1);
+            v
+        });
+        listeners.borrow_mut().insert(id, Box::new(callback));
+        id
+    })
+}
+
+/// Remove a previously registered tab drag listener by ID.
+pub fn remove_tab_drag_listener(id: usize) {
+    TAB_DRAG_LISTENERS.with(|listeners| {
+        listeners.borrow_mut().remove(&id);
     });
 }
 
 fn set_tab_dragging(active: bool) {
     TAB_DRAGGING.with(|c| c.set(active));
     TAB_DRAG_LISTENERS.with(|listeners| {
-        for cb in listeners.borrow().iter() {
+        for cb in listeners.borrow().values() {
             cb(active);
         }
     });
@@ -103,6 +118,8 @@ type PaneWidgetCallback = dyn Fn(&gtk::Widget);
 type PaneSignalCallback = dyn Fn();
 type PanePathCallback = dyn Fn(&str);
 
+type PaneSplitWithTabCallback = dyn Fn(&gtk::Widget, &gtk::Widget, gtk::Orientation, String, bool);
+
 pub struct PaneCallbacks {
     pub on_split: Box<PaneSplitCallback>,
     pub on_close_pane: Box<PaneWidgetCallback>,
@@ -110,6 +127,7 @@ pub struct PaneCallbacks {
     pub on_pwd_changed: Box<PanePathCallback>,
     pub on_empty: Box<PaneWidgetCallback>,
     pub on_state_changed: Box<PaneSignalCallback>,
+    pub on_split_with_tab: Box<PaneSplitWithTabCallback>,
 }
 
 #[derive(Clone)]
@@ -228,7 +246,232 @@ pub const PANE_CSS: &str = r#"
 .limux-tab-overlay:drop(active) {
     box-shadow: none;
 }
+.limux-drop-zone-center {
+    box-shadow: inset 0 0 0 999px rgba(0, 145, 255, 0.15);
+}
+.limux-drop-zone-left {
+    box-shadow: inset 300px 0 0 -100px rgba(0, 145, 255, 0.35);
+}
+.limux-drop-zone-right {
+    box-shadow: inset -300px 0 0 -100px rgba(0, 145, 255, 0.35);
+}
+.limux-drop-zone-top {
+    box-shadow: inset 0 300px 0 -100px rgba(0, 145, 255, 0.35);
+}
+.limux-drop-zone-bottom {
+    box-shadow: inset 0 -300px 0 -100px rgba(0, 145, 255, 0.35);
+}
 "#;
+
+// ---------------------------------------------------------------------------
+// Content area drop zone overlay
+// ---------------------------------------------------------------------------
+
+/// Find the content_stack (Stack widget) inside a pane's outer Box.
+/// Skips the header child which has the "limux-pane-header" CSS class.
+/// May be inside an Overlay wrapper if content drop zones were installed.
+fn find_content_stack(pane_outer: &gtk::Box) -> Option<gtk::Stack> {
+    let mut child = pane_outer.first_child();
+    while let Some(c) = child {
+        if !c.has_css_class("limux-pane-header") {
+            // Direct Stack child (before overlay is installed)
+            if let Some(stack) = c.downcast_ref::<gtk::Stack>() {
+                return Some(stack.clone());
+            }
+            // Inside an Overlay wrapper (after overlay is installed)
+            if let Some(overlay) = c.downcast_ref::<gtk::Overlay>() {
+                if let Some(inner) = overlay.child() {
+                    if let Some(stack) = inner.downcast_ref::<gtk::Stack>() {
+                        return Some(stack.clone());
+                    }
+                }
+            }
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+/// Install the content-area drop zone overlay on an existing pane widget.
+/// Call this after `create_pane` to enable split-on-drop from the body area.
+pub fn install_content_drop_overlay(pane_outer: &gtk::Box) {
+    let Some(content_stack) = find_content_stack(pane_outer) else {
+        return;
+    };
+    let Some(internals) = find_pane_internals(&pane_outer.clone().upcast()) else {
+        return;
+    };
+
+    const ZONE_CLASSES: &[&str] = &[
+        "limux-drop-zone-center",
+        "limux-drop-zone-left",
+        "limux-drop-zone-right",
+        "limux-drop-zone-top",
+        "limux-drop-zone-bottom",
+    ];
+
+    fn clear_classes(ob: &gtk::Box) {
+        for c in ZONE_CLASSES {
+            ob.remove_css_class(c);
+        }
+    }
+
+    fn highlight_zone(ob: &gtk::Box, zone: &str) {
+        clear_classes(ob);
+        ob.add_css_class(zone);
+    }
+
+    // Remove content_stack from pane_outer BEFORE wrapping in overlay
+    if let Some(b) = content_stack
+        .parent()
+        .and_then(|p| p.downcast::<gtk::Box>().ok())
+    {
+        b.remove(&content_stack);
+    }
+
+    // Overlay wrapper around content_stack — overlay_box floats on top
+    // for visual feedback so it renders above terminals and webviews.
+    let overlay_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    overlay_box.set_hexpand(true);
+    overlay_box.set_vexpand(true);
+    overlay_box.set_can_target(false);
+    overlay_box.set_visible(false);
+
+    let wrapper = gtk::Overlay::new();
+    wrapper.set_child(Some(&content_stack));
+    wrapper.set_hexpand(true);
+    wrapper.set_vexpand(true);
+    wrapper.add_overlay(&overlay_box);
+
+    // Insert wrapper where content_stack used to be (after header)
+    let header = pane_outer.first_child();
+    pane_outer.insert_child_after(&wrapper, header.as_ref());
+
+    // DropTarget on content_stack (not on wrapper — proven to work)
+    let content_drop = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+
+    {
+        let ob = overlay_box.clone();
+        let ws_drag = internals.workspace_dragging.clone();
+        content_drop.connect_accept(move |_dt, _drag| !ws_drag.get() && is_tab_dragging());
+        let ws_drag = internals.workspace_dragging.clone();
+        content_drop.connect_motion(move |_dt, x, y| {
+            if ws_drag.get() || !is_tab_dragging() {
+                return gtk::gdk::DragAction::empty();
+            }
+            let w = ob.width() as f64;
+            let h = ob.height() as f64;
+            if w <= 0.0 || h <= 0.0 {
+                return gtk::gdk::DragAction::empty();
+            }
+            let zone = if x < w * 0.2 {
+                "limux-drop-zone-left"
+            } else if x > w * 0.8 {
+                "limux-drop-zone-right"
+            } else if y < h * 0.2 {
+                "limux-drop-zone-top"
+            } else if y > h * 0.8 {
+                "limux-drop-zone-bottom"
+            } else {
+                "limux-drop-zone-center"
+            };
+            highlight_zone(&ob, zone);
+            gtk::gdk::DragAction::MOVE
+        });
+    }
+
+    {
+        let ob = overlay_box.clone();
+        content_drop.connect_leave(move |_dt| {
+            clear_classes(&ob);
+        });
+    }
+
+    {
+        let ob = overlay_box.clone();
+        let po = pane_outer.clone();
+        let ts = internals.tab_state.clone();
+        let cb = internals.callbacks.clone();
+        content_drop.connect_drop(move |_dt, value, x, y| {
+            clear_classes(&ob);
+            let Ok(drag_data) = value.get::<String>() else {
+                return false;
+            };
+            let Some((src_pid, src_tid)) = drag_data.split_once(':') else {
+                return false;
+            };
+            let Ok(src_pane_id) = src_pid.parse::<u32>() else {
+                return false;
+            };
+            let w = ob.width() as f64;
+            let h = ob.height() as f64;
+            if w <= 0.0 || h <= 0.0 {
+                return false;
+            }
+            let tab_id = src_tid.to_string();
+            let pane_widget: gtk::Widget = po.clone().upcast();
+            if x < w * 0.2 || x > w * 0.8 {
+                if let Some(src_widget) = find_pane_widget_by_id(src_pane_id) {
+                    (cb.on_split_with_tab)(
+                        &src_widget,
+                        &pane_widget,
+                        gtk::Orientation::Horizontal,
+                        tab_id,
+                        x < w * 0.2,
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else if y < h * 0.2 || y > h * 0.8 {
+                if let Some(src_widget) = find_pane_widget_by_id(src_pane_id) {
+                    (cb.on_split_with_tab)(
+                        &src_widget,
+                        &pane_widget,
+                        gtk::Orientation::Vertical,
+                        tab_id,
+                        y < h * 0.2,
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                if let Some(src_widget) = find_pane_widget_by_id(src_pane_id) {
+                    if let Some(src_int) = find_pane_internals(&src_widget) {
+                        if let Some(tgt_int) = find_pane_internals(&po.clone().upcast()) {
+                            if src_int.pane_id != tgt_int.pane_id {
+                                let insert_idx = ts.borrow().tabs.len();
+                                move_tab_between_panes(&src_int, &tgt_int, src_tid, insert_idx);
+                                (cb.on_state_changed)();
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+        });
+    }
+
+    content_stack.add_controller(content_drop);
+
+    // Show/hide overlay_box when tab drag state changes
+    let ob = overlay_box.clone();
+    let ws_drag = internals.workspace_dragging.clone();
+    let listener_id = on_tab_drag_change(move |dragging| {
+        ob.set_visible(dragging && !ws_drag.get());
+        if !dragging {
+            clear_classes(&ob);
+        }
+    });
+
+    // Remove listener when pane is destroyed to avoid unbounded growth
+    let po = pane_outer.clone();
+    po.connect_destroy(move |_| {
+        remove_tab_drag_listener(listener_id);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // PaneWidget builder
@@ -238,6 +481,7 @@ pub fn create_pane(
     callbacks: Rc<PaneCallbacks>,
     working_directory: Option<&str>,
     initial_state: Option<&PaneState>,
+    skip_default_tab: bool,
 ) -> gtk::Box {
     // Store workspace working directory for new tabs/splits to inherit
     let ws_wd: Rc<RefCell<Option<String>>> =
@@ -402,8 +646,8 @@ pub fn create_pane(
     }
 
     if let Some(saved_state) = initial_state {
-        restore_tabs_from_state(&internals, working_directory, saved_state);
-    } else {
+        restore_tabs_from_state(&internals, working_directory, saved_state, skip_default_tab);
+    } else if !skip_default_tab {
         add_terminal_tab_inner(&internals, working_directory, None);
     }
 
@@ -609,9 +853,12 @@ fn restore_tabs_from_state(
     internals: &Rc<PaneInternals>,
     working_directory: Option<&str>,
     saved_state: &PaneState,
+    skip_default_tab: bool,
 ) {
     if saved_state.tabs.is_empty() {
-        add_terminal_tab_inner(internals, working_directory, None);
+        if !skip_default_tab {
+            add_terminal_tab_inner(internals, working_directory, None);
+        }
         return;
     }
 
