@@ -51,35 +51,35 @@ T3 ── T4 ──┘
 - **description**: Refactor the current startup-only shortcut wiring into a live update path. `AppState` should own the effective shortcut registry in a mutable form, expose one helper that swaps in a newly validated registry, reapplies GTK accelerators through the `adw::Application`, and refreshes host-owned tooltip surfaces that show shortcuts today. Extend pane internals as needed so existing pane header buttons can refresh their tooltips instead of only reflecting shortcuts at creation time.
 - **validation**: A single runtime update path exists for shortcut changes. After applying a new registry, the capture-phase handler, GTK accelerators, sidebar tooltip, and pane button tooltips all reflect the new bindings without reopening the app.
 - **status**: Completed
-- **log**: RED phase used focused `shortcut_config` tests for invalid base modifiers, modifier-only keys, override serialization, preserved top-level config keys, and non-clobbering invalid-JSON failure behavior. GREEN changes extended the canonical shortcut model with host-binding validation (`Ctrl` or `Alt` required, modifier-only keys rejected), editor-facing default/current display helpers, override serialization, and atomic merged writes for the `shortcuts` section inside `config.json`. Validation command: `cargo test -p limux-host-linux shortcut_config::tests -- --nocapture`.
-- **files edited/created**: `rust/limux-host-linux/src/shortcut_config.rs`, `terminal-keybinds-settings-plan.md`
+- **log**: Moved GTK accelerator application into a reusable window-owned helper and added `apply_shortcut_config(...)` so a newly validated shortcut registry can replace the live `AppState` value, refresh GTK accelerators, update sidebar toggle tooltips, and refresh existing pane action tooltips through cached `PaneInternals` button refs. Validation: `cargo test -p limux-host-linux` and `cargo build -p limux-host-linux --features webkit`.
+- **files edited/created**: `rust/limux-host-linux/src/main.rs`, `rust/limux-host-linux/src/pane.rs`, `rust/limux-host-linux/src/window.rs`, `terminal-keybinds-settings-plan.md`
 
 ### T3: Add a Terminal Context-Menu Entry Point for Keybind Settings
 - **depends_on**: []
 - **location**: `rust/limux-host-linux/src/terminal.rs`, `rust/limux-host-linux/src/pane.rs`, `rust/limux-host-linux/src/window.rs`
 - **description**: Extend the existing terminal right-click menu to include a `Keybinds` item without regressing the current Copy/Paste/Split/Clear actions. Thread a first-class `on_open_keybinds` callback through `TerminalCallbacks` and `PaneCallbacks` so the terminal surface can ask the window layer to open the keybind editor using the same primary host codepath every time. Make the handoff explicit: selecting `Keybinds` should close the small context menu first and only then open the larger editor popover, ideally via an idle callback, so the new popover does not immediately dismiss or inherit the wrong transient parent state.
 - **validation**: Right-clicking a terminal still shows the current context menu items plus `Keybinds`, activating `Keybinds` routes to one window-owned open-editor function rather than embedding editor state directly in `terminal.rs`, and the editor opens reliably after the context menu closes.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Added a `Keybinds` action to the terminal right-click menu and threaded a first-class `on_open_keybinds` callback through `TerminalCallbacks` and `PaneCallbacks` into `window.rs`. The terminal menu now pops down first and schedules the editor open via `glib::idle_add_local_once(...)` so the larger editor popover is opened from the window layer without nested-popover dismissal glitches. Validation: `cargo test -p limux-host-linux`.
+- **files edited/created**: `rust/limux-host-linux/src/terminal.rs`, `rust/limux-host-linux/src/pane.rs`, `rust/limux-host-linux/src/window.rs`, `terminal-keybinds-settings-plan.md`
 
 ### T4: Build the Keybinds Editor Popover Shell
 - **depends_on**: [T1, T3]
 - **location**: `rust/limux-host-linux/src/keybind_editor.rs` (new), with thin integration hooks in `rust/limux-host-linux/src/window.rs`
 - **description**: Create the actual keybind editor popover as a dedicated module anchored from the terminal surface. The shell should be a `gtk::Popover` with `set_autohide(true)` so clicking outside dismisses it, plus a header row that includes a `Keybinds` title and an explicit close button at the top right. The body should be scrollable and render one row per canonical shortcut definition, showing the human-readable action label, the current binding, and the default binding as supporting text. Each binding cell should be an entry-like capture control, not a freeform text editor, so keyboard input is always normalized through the canonical shortcut path instead of mixing raw text editing with shortcut capture semantics.
 - **validation**: Opening the editor from the terminal menu shows all current shortcut definitions, the top-right close button dismisses it, outside clicks also dismiss it with no orphaned popovers or double-parenting issues, and the binding cells present a clear idle/listening/error state without allowing arbitrary text entry.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: Added the dedicated `keybind_editor.rs` module and its CSS, then built a window-owned `gtk::Popover` editor shell anchored to the terminal surface. The editor now renders every host shortcut with current binding plus default binding text, includes a top-right close button, and uses `set_autohide(true)` so outside clicks close it. Validation: `cargo test -p limux-host-linux` including `keybind_editor::tests::binding_button_label_prefers_current_binding_and_listening_state`.
+- **files edited/created**: `rust/limux-host-linux/src/keybind_editor.rs`, `rust/limux-host-linux/src/main.rs`, `rust/limux-host-linux/src/window.rs`, `terminal-keybinds-settings-plan.md`
 
 ### T5: Implement Capture, Conflict Handling, Persistence, and Live Apply
 - **depends_on**: [T2, T4]
 - **location**: `rust/limux-host-linux/src/keybind_editor.rs`, `rust/limux-host-linux/src/window.rs`, `rust/limux-host-linux/src/shortcut_config.rs`
 - **description**: Implement the row-level editing workflow. Clicking a shortcut field should enter a clear listening state, attach a `GtkEventControllerKey`, and capture the next non-modifier key combo. Valid captures should be normalized through the canonical shortcut model, rejected if they do not use `Ctrl` or `Alt`, rejected if they conflict with another active binding, merged atomically into the `shortcuts` section of `config.json`, reloaded through the canonical config loader, and only then applied live through the shared runtime update helper. Invalid captures or write failures should leave the previous binding intact and surface a row-local error message instead of silently failing.
 - **validation**: A remap such as `Ctrl+H` for `Split Right` can be captured from the UI, written to config, reloaded, applied live, and used immediately. Conflicts, invalid combos, and disk-write failures show deterministic errors, and the previous working binding remains active until a valid replacement is both persisted and reloaded successfully.
-- **status**: Not Completed
-- **log**:
-- **files edited/created**:
+- **status**: Completed
+- **log**: The editor’s binding controls now enter a listening state, capture the next key combo through `GtkEventControllerKey`, validate it through the canonical shortcut model, persist it through `write_shortcuts(...)`, reload the effective config, and apply it live with `apply_shortcut_config(...)`. Invalid combos and duplicate bindings surface row-local errors without replacing the prior working binding. Validation: `cargo test -p limux-host-linux` and `cargo build -p limux-host-linux --features webkit`.
+- **files edited/created**: `rust/limux-host-linux/src/keybind_editor.rs`, `rust/limux-host-linux/src/shortcut_config.rs`, `rust/limux-host-linux/src/window.rs`, `terminal-keybinds-settings-plan.md`
 
 ### T6: Add Regression Coverage and Manual Verification Notes
 - **depends_on**: [T5]

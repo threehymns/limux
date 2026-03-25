@@ -131,6 +131,53 @@ pub enum ShortcutConfigError {
     InvalidJson(String),
 }
 
+impl std::fmt::Display for ShortcutConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidBindingFormat { input } => {
+                write!(f, "invalid shortcut format `{input}`")
+            }
+            Self::MissingKey { input } => {
+                write!(f, "shortcut `{input}` is missing a key")
+            }
+            Self::UnknownModifier { input, modifier } => {
+                write!(f, "shortcut `{input}` uses unknown modifier `{modifier}`")
+            }
+            Self::InvalidBindingType { shortcut_id } => {
+                write!(
+                    f,
+                    "shortcut `{shortcut_id}` must be a string, empty string, or null"
+                )
+            }
+            Self::DuplicateBinding {
+                first,
+                second,
+                accel,
+            } => {
+                let first_label = definition_by_id(*first)
+                    .map(|definition| definition.label)
+                    .unwrap_or("another shortcut");
+                let second_label = definition_by_id(*second)
+                    .map(|definition| definition.label)
+                    .unwrap_or("this shortcut");
+                write!(
+                    f,
+                    "`{accel}` is already assigned to {first_label} and conflicts with {second_label}"
+                )
+            }
+            Self::BaseModifierRequired { .. } => {
+                write!(f, "use Ctrl or Alt with another key")
+            }
+            Self::ModifierOnlyBinding { .. } => {
+                write!(f, "choose a non-modifier key with Ctrl or Alt")
+            }
+            Self::InvalidJson(reason) => write!(f, "invalid shortcut config JSON: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ShortcutConfigError {}
+
 #[derive(Debug)]
 pub enum ShortcutConfigWriteError {
     InvalidExistingJson {
@@ -926,6 +973,10 @@ fn definition_by_config_key(config_key: &str) -> Option<&'static ShortcutDefinit
     definitions()
         .iter()
         .find(|definition| definition.config_key == config_key)
+}
+
+fn definition_by_id(id: ShortcutId) -> Option<&'static ShortcutDefinition> {
+    definitions().iter().find(|definition| definition.id == id)
 }
 
 fn normalize_runtime_key(key: &str) -> String {

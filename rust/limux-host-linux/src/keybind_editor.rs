@@ -1,0 +1,408 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use gtk::prelude::*;
+use gtk4 as gtk;
+
+use crate::shortcut_config::{
+    self, NormalizedShortcut, ResolvedShortcutConfig, ShortcutConfigError, ShortcutId,
+};
+
+pub const KEYBIND_EDITOR_CSS: &str = r#"
+.limux-keybind-editor {
+    background: linear-gradient(180deg, rgba(24, 24, 24, 0.98), rgba(18, 18, 18, 0.98));
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 16px;
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.45);
+    padding: 12px;
+}
+.limux-keybind-header {
+    margin-bottom: 8px;
+}
+.limux-keybind-title {
+    color: white;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+.limux-keybind-hint {
+    color: rgba(255, 255, 255, 0.62);
+    font-size: 12px;
+    margin-bottom: 10px;
+}
+.limux-keybind-close {
+    background: rgba(255, 255, 255, 0.05);
+    border: none;
+    border-radius: 999px;
+    color: rgba(255, 255, 255, 0.7);
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+}
+.limux-keybind-close:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: white;
+}
+.limux-keybind-scroll viewport {
+    background: transparent;
+}
+.limux-keybind-row {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+}
+.limux-keybind-action {
+    color: white;
+    font-weight: 600;
+}
+.limux-keybind-default {
+    color: rgba(255, 255, 255, 0.58);
+    font-size: 12px;
+}
+.limux-keybind-capture {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 10px;
+    color: white;
+    min-width: 168px;
+    padding: 8px 12px;
+}
+.limux-keybind-capture:hover {
+    background: rgba(255, 255, 255, 0.09);
+}
+.limux-keybind-capture-listening {
+    border-color: rgba(111, 211, 255, 0.85);
+    box-shadow: 0 0 0 2px rgba(111, 211, 255, 0.2);
+}
+.limux-keybind-error {
+    color: #ff8a8a;
+    font-size: 12px;
+    margin-top: 6px;
+}
+"#;
+
+#[derive(Clone)]
+struct RowWidgets {
+    id: ShortcutId,
+    binding_button: gtk::Button,
+    error_label: gtk::Label,
+}
+
+pub fn build_keybind_editor(
+    anchor: &gtk::Widget,
+    shortcuts: &ResolvedShortcutConfig,
+    on_capture: Rc<
+        dyn Fn(ShortcutId, NormalizedShortcut) -> Result<ResolvedShortcutConfig, String>,
+    >,
+) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.set_parent(anchor);
+    popover.set_has_arrow(false);
+    popover.set_autohide(true);
+
+    let state = Rc::new(RefCell::new(shortcuts.clone()));
+    let listening = Rc::new(RefCell::new(None::<ShortcutId>));
+    let errors = Rc::new(RefCell::new(HashMap::<ShortcutId, String>::new()));
+    let rows = Rc::new(RefCell::new(Vec::<RowWidgets>::new()));
+
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    outer.add_css_class("limux-keybind-editor");
+    outer.set_width_request(540);
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    header.add_css_class("limux-keybind-header");
+
+    let title = gtk::Label::builder()
+        .label("Keybinds")
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+    title.add_css_class("limux-keybind-title");
+
+    let close_btn = gtk::Button::with_label("×");
+    close_btn.add_css_class("limux-keybind-close");
+    {
+        let popover = popover.clone();
+        close_btn.connect_clicked(move |_| {
+            popover.popdown();
+        });
+    }
+
+    header.append(&title);
+    header.append(&close_btn);
+
+    let hint = gtk::Label::builder()
+        .label(
+            "Click a shortcut field, then press a Ctrl or Alt combo. Shift is allowed as an additional modifier.",
+        )
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+    hint.add_css_class("limux-keybind-hint");
+
+    let rows_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    for definition in shortcut_config::definitions() {
+        let shortcut_id = definition.id;
+        let config_key = definition.config_key;
+
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        row.add_css_class("limux-keybind-row");
+
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+
+        let meta = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        meta.set_hexpand(true);
+
+        let action_label = gtk::Label::builder()
+            .label(definition.label)
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        action_label.add_css_class("limux-keybind-action");
+
+        let default_label = gtk::Label::builder()
+            .label(format!(
+                "Default: {}",
+                shortcuts
+                    .default_display_label_for_id(definition.id)
+                    .unwrap_or_else(|| definition.default_display_label())
+            ))
+            .xalign(0.0)
+            .wrap(true)
+            .build();
+        default_label.add_css_class("limux-keybind-default");
+
+        meta.append(&action_label);
+        meta.append(&default_label);
+
+        let binding_button =
+            gtk::Button::with_label(&binding_button_label(shortcuts, definition.id, false));
+        binding_button.add_css_class("limux-keybind-capture");
+        binding_button.set_focusable(true);
+        binding_button.set_can_focus(true);
+        binding_button.set_halign(gtk::Align::End);
+
+        let error_label = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .visible(false)
+            .build();
+        error_label.add_css_class("limux-keybind-error");
+
+        top.append(&meta);
+        top.append(&binding_button);
+        row.append(&top);
+        row.append(&error_label);
+        rows_box.append(&row);
+
+        rows.borrow_mut().push(RowWidgets {
+            id: definition.id,
+            binding_button: binding_button.clone(),
+            error_label: error_label.clone(),
+        });
+
+        {
+            let listening = listening.clone();
+            let errors = errors.clone();
+            let rows = rows.clone();
+            let state = state.clone();
+            binding_button.connect_clicked(move |button| {
+                *listening.borrow_mut() = Some(shortcut_id);
+                errors.borrow_mut().remove(&shortcut_id);
+                refresh_rows(
+                    &rows.borrow(),
+                    &state.borrow(),
+                    *listening.borrow(),
+                    &errors.borrow(),
+                );
+                button.grab_focus();
+            });
+        }
+
+        {
+            let listening = listening.clone();
+            let errors = errors.clone();
+            let rows = rows.clone();
+            let state = state.clone();
+            let on_capture = on_capture.clone();
+            let key_controller = gtk::EventControllerKey::new();
+            key_controller.connect_key_pressed(move |_, keyval, _keycode, modifier| {
+                if *listening.borrow() != Some(shortcut_id) {
+                    return gtk::glib::Propagation::Proceed;
+                }
+
+                if keyval == gtk::gdk::Key::Escape {
+                    *listening.borrow_mut() = None;
+                    errors.borrow_mut().remove(&shortcut_id);
+                    refresh_rows(&rows.borrow(), &state.borrow(), None, &errors.borrow());
+                    return gtk::glib::Propagation::Stop;
+                }
+
+                let Some(binding) = NormalizedShortcut::from_gdk_key(keyval, modifier) else {
+                    *listening.borrow_mut() = None;
+                    errors.borrow_mut().insert(
+                        shortcut_id,
+                        validation_error_message(&ShortcutConfigError::ModifierOnlyBinding {
+                            shortcut_id: config_key.to_string(),
+                            input: String::new(),
+                        }),
+                    );
+                    refresh_rows(&rows.borrow(), &state.borrow(), None, &errors.borrow());
+                    return gtk::glib::Propagation::Stop;
+                };
+
+                if let Err(err) = binding.validate_host_binding(config_key) {
+                    *listening.borrow_mut() = None;
+                    errors
+                        .borrow_mut()
+                        .insert(shortcut_id, validation_error_message(&err));
+                    refresh_rows(&rows.borrow(), &state.borrow(), None, &errors.borrow());
+                    return gtk::glib::Propagation::Stop;
+                }
+
+                match on_capture(shortcut_id, binding) {
+                    Ok(updated) => {
+                        *state.borrow_mut() = updated;
+                        *listening.borrow_mut() = None;
+                        errors.borrow_mut().remove(&shortcut_id);
+                    }
+                    Err(err) => {
+                        *listening.borrow_mut() = None;
+                        errors.borrow_mut().insert(shortcut_id, err);
+                    }
+                }
+
+                refresh_rows(
+                    &rows.borrow(),
+                    &state.borrow(),
+                    *listening.borrow(),
+                    &errors.borrow(),
+                );
+                gtk::glib::Propagation::Stop
+            });
+            binding_button.add_controller(key_controller);
+        }
+    }
+
+    refresh_rows(&rows.borrow(), shortcuts, None, &HashMap::new());
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .min_content_height(420)
+        .child(&rows_box)
+        .build();
+    scroller.add_css_class("limux-keybind-scroll");
+
+    outer.append(&header);
+    outer.append(&hint);
+    outer.append(&scroller);
+
+    popover.set_child(Some(&outer));
+    popover
+}
+
+fn binding_button_label(
+    shortcuts: &ResolvedShortcutConfig,
+    id: ShortcutId,
+    listening: bool,
+) -> String {
+    if listening {
+        return "Press shortcut…".to_string();
+    }
+
+    shortcuts
+        .display_label_for_id(id)
+        .unwrap_or_else(|| "Unbound".to_string())
+}
+
+fn refresh_rows(
+    rows: &[RowWidgets],
+    shortcuts: &ResolvedShortcutConfig,
+    listening: Option<ShortcutId>,
+    errors: &HashMap<ShortcutId, String>,
+) {
+    for row in rows {
+        let is_listening = listening == Some(row.id);
+        row.binding_button
+            .set_label(&binding_button_label(shortcuts, row.id, is_listening));
+        if is_listening {
+            row.binding_button
+                .add_css_class("limux-keybind-capture-listening");
+        } else {
+            row.binding_button
+                .remove_css_class("limux-keybind-capture-listening");
+        }
+
+        if let Some(error) = errors.get(&row.id) {
+            row.error_label.set_label(error);
+            row.error_label.set_visible(true);
+        } else {
+            row.error_label.set_visible(false);
+        }
+    }
+}
+
+fn validation_error_message(err: &ShortcutConfigError) -> String {
+    match err {
+        ShortcutConfigError::BaseModifierRequired { .. } => {
+            "Use Ctrl or Alt together with another key.".to_string()
+        }
+        ShortcutConfigError::ModifierOnlyBinding { .. } => {
+            "Choose a non-modifier key for this shortcut.".to_string()
+        }
+        ShortcutConfigError::DuplicateBinding { .. } => {
+            "That shortcut is already assigned to another action.".to_string()
+        }
+        _ => "That shortcut is not valid.".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{binding_button_label, validation_error_message};
+    use crate::shortcut_config::{
+        default_shortcuts, resolve_shortcuts_from_str, ShortcutConfigError, ShortcutId,
+    };
+
+    #[test]
+    fn binding_button_label_prefers_current_binding_and_listening_state() {
+        let defaults = default_shortcuts();
+        assert_eq!(
+            binding_button_label(&defaults, ShortcutId::SplitRight, false),
+            "Ctrl+D"
+        );
+        assert_eq!(
+            binding_button_label(&defaults, ShortcutId::SplitRight, true),
+            "Press shortcut…"
+        );
+
+        let remapped = resolve_shortcuts_from_str(
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Ctrl><Alt>h"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            binding_button_label(&remapped, ShortcutId::SplitRight, false),
+            "Ctrl+Alt+H"
+        );
+    }
+
+    #[test]
+    fn validation_error_message_is_user_facing() {
+        let err = ShortcutConfigError::BaseModifierRequired {
+            shortcut_id: "split_right".to_string(),
+            input: "<Shift>h".to_string(),
+        };
+        assert_eq!(
+            validation_error_message(&err),
+            "Use Ctrl or Alt together with another key."
+        );
+    }
+}

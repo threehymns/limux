@@ -6,6 +6,7 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 
+use crate::keybind_editor;
 use crate::layout_state::{
     self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, SplitOrientation, SplitState,
     WorkspaceState,
@@ -46,6 +47,7 @@ struct Workspace {
 }
 
 struct AppState {
+    app: adw::Application,
     workspaces: Vec<Workspace>,
     active_idx: usize,
     shortcuts: Rc<ResolvedShortcutConfig>,
@@ -53,7 +55,9 @@ struct AppState {
     sidebar_list: gtk::ListBox,
     paned: gtk::Paned,
     new_ws_btn: gtk::Button,
+    collapse_btn: gtk::Button,
     expand_btn: gtk::Button,
+    keybind_editor: Option<gtk::Popover>,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
@@ -544,7 +548,11 @@ row:selected .limux-ws-path {
 pub fn build_window(app: &adw::Application, shortcuts: Rc<ResolvedShortcutConfig>) {
     // Load CSS
     let provider = gtk::CssProvider::new();
-    let all_css = format!("{CSS}\n{}", pane::PANE_CSS);
+    let all_css = format!(
+        "{CSS}\n{}\n{}",
+        pane::PANE_CSS,
+        keybind_editor::KEYBIND_EDITOR_CSS
+    );
     provider.load_from_data(&all_css);
     gtk::style_context_add_provider_for_display(
         &gtk::gdk::Display::default().expect("display"),
@@ -711,6 +719,7 @@ pub fn build_window(app: &adw::Application, shortcuts: Rc<ResolvedShortcutConfig
     window.set_content(Some(&vbox));
 
     let state: State = Rc::new(RefCell::new(AppState {
+        app: app.clone(),
         workspaces: Vec::new(),
         active_idx: 0,
         shortcuts,
@@ -718,13 +727,17 @@ pub fn build_window(app: &adw::Application, shortcuts: Rc<ResolvedShortcutConfig
         sidebar_list: sidebar_list.clone(),
         paned: main_paned.clone(),
         new_ws_btn: new_ws_btn.clone(),
+        collapse_btn: collapse_btn.clone(),
         expand_btn: expand_btn.clone(),
+        keybind_editor: None,
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
         persistence_suspended: false,
         save_queued: false,
     }));
+
+    apply_shortcuts_to_application(app, &state.borrow().shortcuts);
 
     {
         let state = state.clone();
@@ -941,6 +954,122 @@ fn sidebar_toggle_tooltip(shortcuts: &ResolvedShortcutConfig, visible: bool) -> 
         "Show sidebar"
     };
     shortcuts.tooltip_text(ShortcutId::ToggleSidebar, base)
+}
+
+fn apply_shortcuts_to_application(app: &adw::Application, shortcuts: &ResolvedShortcutConfig) {
+    for (action_name, accels) in shortcuts.gtk_accel_entries() {
+        let accel_refs: Vec<&str> = accels.iter().map(String::as_str).collect();
+        app.set_accels_for_action(action_name, &accel_refs);
+    }
+}
+
+fn apply_shortcut_config(state: &State, shortcuts: ResolvedShortcutConfig) {
+    let (app, collapse_btn, expand_btn, workspace_roots, shortcuts_rc) = {
+        let mut s = state.borrow_mut();
+        s.shortcuts = Rc::new(shortcuts);
+        (
+            s.app.clone(),
+            s.collapse_btn.clone(),
+            s.expand_btn.clone(),
+            s.workspaces
+                .iter()
+                .map(|ws| ws.root.clone())
+                .collect::<Vec<_>>(),
+            s.shortcuts.clone(),
+        )
+    };
+
+    apply_shortcuts_to_application(&app, &shortcuts_rc);
+    collapse_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts_rc, true)));
+    expand_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts_rc, false)));
+    for root in workspace_roots {
+        refresh_shortcut_tooltips_in_layout(&root, &shortcuts_rc);
+    }
+}
+
+fn refresh_shortcut_tooltips_in_layout(widget: &gtk::Widget, shortcuts: &ResolvedShortcutConfig) {
+    if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
+        if let Some(start) = paned.start_child() {
+            refresh_shortcut_tooltips_in_layout(&start, shortcuts);
+        }
+        if let Some(end) = paned.end_child() {
+            refresh_shortcut_tooltips_in_layout(&end, shortcuts);
+        }
+        return;
+    }
+
+    pane::refresh_shortcut_tooltips(widget, shortcuts);
+}
+
+fn persist_shortcut_binding(
+    state: &State,
+    id: ShortcutId,
+    binding: shortcut_config::NormalizedShortcut,
+) -> Result<ResolvedShortcutConfig, String> {
+    let updated = {
+        let s = state.borrow();
+        s.shortcuts
+            .with_binding(id, Some(binding))
+            .map_err(|err| err.to_string())?
+    };
+
+    let Some(path) = shortcut_config::config_path() else {
+        return Err("config directory unavailable".to_string());
+    };
+
+    shortcut_config::write_shortcuts(&path, &updated).map_err(|err| err.to_string())?;
+    let reloaded = shortcut_config::load_shortcuts_or_default(&path);
+    if !reloaded.warnings.is_empty() {
+        return Err(reloaded.warnings.join("; "));
+    }
+
+    apply_shortcut_config(state, reloaded.clone());
+    Ok(reloaded)
+}
+
+fn open_keybind_editor(state: &State, anchor: &gtk::Widget) {
+    let existing = {
+        let mut s = state.borrow_mut();
+        s.keybind_editor.take()
+    };
+    if let Some(popover) = existing {
+        popover.popdown();
+    }
+
+    let shortcuts = {
+        let s = state.borrow();
+        s.shortcuts.clone()
+    };
+    let on_capture: Rc<
+        dyn Fn(
+            ShortcutId,
+            shortcut_config::NormalizedShortcut,
+        ) -> Result<ResolvedShortcutConfig, String>,
+    > = {
+        let state = state.clone();
+        Rc::new(move |id, binding| persist_shortcut_binding(&state, id, binding))
+    };
+    let popover = keybind_editor::build_keybind_editor(anchor, &shortcuts, on_capture);
+
+    {
+        let state = state.clone();
+        popover.connect_closed(move |popover: &gtk::Popover| {
+            let clear_ref = {
+                let s = state.borrow();
+                s.keybind_editor
+                    .as_ref()
+                    .map(|current| current == popover)
+                    .unwrap_or(false)
+            };
+            if clear_ref {
+                state.borrow_mut().keybind_editor = None;
+            }
+            popover.unparent();
+        });
+    }
+
+    state.borrow_mut().keybind_editor = Some(popover.clone());
+    popover.popup();
 }
 
 fn activate_workspace_shortcut(state: &State, idx: usize) {
@@ -1658,6 +1787,7 @@ fn create_pane_for_workspace(
     let state_for_split = state.clone();
     let state_for_close = state.clone();
     let state_for_bell = state.clone();
+    let state_for_keybinds = state.clone();
     let state_for_pwd = state.clone();
     let state_for_empty = state.clone();
     let ws_id_split = ws_id.to_string();
@@ -1680,6 +1810,9 @@ fn create_pane_for_workspace(
             glib::idle_add_local_once(move || {
                 mark_workspace_unread(&state, &ws_id);
             });
+        }),
+        on_open_keybinds: Box::new(move |anchor| {
+            open_keybind_editor(&state_for_keybinds, anchor);
         }),
         on_pwd_changed: Box::new(move |pwd: &str| {
             let state = state_for_pwd.clone();

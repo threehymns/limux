@@ -30,6 +30,7 @@ static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
 type VoidCallback = dyn Fn();
+type WidgetCallback = dyn Fn(&gtk::Widget);
 
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
@@ -369,6 +370,7 @@ pub struct TerminalCallbacks {
     pub on_close: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
     pub on_split_down: Box<VoidCallback>,
+    pub on_open_keybinds: Box<WidgetCallback>,
 }
 
 /// Create a new Ghostty-powered terminal widget.
@@ -838,6 +840,7 @@ fn show_terminal_context_menu(
         ("---", false),
         ("Split Right", true),
         ("Split Down", true),
+        ("Keybinds", true),
         ("---", false),
         ("Clear", true),
     ];
@@ -874,6 +877,7 @@ fn show_terminal_context_menu(
             let label = btn.label().unwrap_or_default().to_string();
             let pop = popover.clone();
             let cb = callbacks.clone();
+            let gl_area = gl_area.clone();
 
             btn.connect_clicked(move |_| {
                 pop.popdown();
@@ -882,6 +886,13 @@ fn show_terminal_context_menu(
                     "Paste" => surface_action(surface, "paste_from_clipboard"),
                     "Split Right" => (cb.on_split_right)(),
                     "Split Down" => (cb.on_split_down)(),
+                    "Keybinds" => {
+                        let anchor: gtk::Widget = gl_area.clone().upcast();
+                        let cb = cb.clone();
+                        glib::idle_add_local_once(move || {
+                            (cb.on_open_keybinds)(&anchor);
+                        });
+                    }
                     "Clear" => surface_action(surface, "clear_screen"),
                     _ => {}
                 }

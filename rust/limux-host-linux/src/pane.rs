@@ -28,6 +28,7 @@ pub struct PaneCallbacks {
     pub on_split: Box<PaneSplitCallback>,
     pub on_close_pane: Box<PaneWidgetCallback>,
     pub on_bell: Box<PaneSignalCallback>,
+    pub on_open_keybinds: Box<PaneWidgetCallback>,
     pub on_pwd_changed: Box<PanePathCallback>,
     pub on_empty: Box<PaneWidgetCallback>,
     pub on_state_changed: Box<PaneSignalCallback>,
@@ -307,6 +308,10 @@ pub fn create_pane(
         pane_outer: outer.clone(),
         callbacks: callbacks.clone(),
         working_directory: ws_wd.clone(),
+        new_terminal_button: new_term_btn.clone(),
+        split_right_button: split_h_btn.clone(),
+        split_down_button: split_v_btn.clone(),
+        close_pane_button: close_btn.clone(),
     });
     unsafe {
         outer.set_data("limux-pane-internals", internals);
@@ -388,6 +393,10 @@ pub struct PaneInternals {
     pane_outer: gtk::Box,
     callbacks: Rc<PaneCallbacks>,
     working_directory: Rc<std::cell::RefCell<Option<String>>>,
+    new_terminal_button: gtk::Button,
+    split_right_button: gtk::Button,
+    split_down_button: gtk::Button,
+    close_pane_button: gtk::Button,
 }
 
 impl TabState {
@@ -644,6 +653,12 @@ fn add_terminal_tab_inner(
                     (cb.on_split)(&w, gtk::Orientation::Vertical);
                 }
             }),
+            on_open_keybinds: Box::new({
+                let cb = callbacks.clone();
+                move |anchor| {
+                    (cb.on_open_keybinds)(anchor);
+                }
+            }),
         }
     };
 
@@ -791,6 +806,41 @@ pub fn add_browser_tab_to_pane(pane_widget: &gtk::Widget) {
             None,
         );
     }
+}
+
+pub fn refresh_shortcut_tooltips(pane_widget: &gtk::Widget, shortcuts: &ResolvedShortcutConfig) {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return;
+    };
+
+    internals
+        .new_terminal_button
+        .set_tooltip_text(Some(&pane_action_tooltip(
+            shortcuts,
+            "New terminal tab",
+            Some(ShortcutId::NewTerminal),
+        )));
+    internals
+        .split_right_button
+        .set_tooltip_text(Some(&pane_action_tooltip(
+            shortcuts,
+            "Split right",
+            Some(ShortcutId::SplitRight),
+        )));
+    internals
+        .split_down_button
+        .set_tooltip_text(Some(&pane_action_tooltip(
+            shortcuts,
+            "Split down",
+            Some(ShortcutId::SplitDown),
+        )));
+    internals
+        .close_pane_button
+        .set_tooltip_text(Some(&pane_action_tooltip(
+            shortcuts,
+            "Close pane",
+            Some(ShortcutId::CloseFocusedPane),
+        )));
 }
 
 pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {

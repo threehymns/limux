@@ -1,3 +1,4 @@
+mod keybind_editor;
 mod layout_state;
 mod pane;
 mod shortcut_config;
@@ -110,12 +111,6 @@ fn main() {
             window::build_window(app, shortcuts.clone());
         });
     }
-
-    for (action_name, accels) in shortcuts.gtk_accel_entries() {
-        let accel_refs: Vec<&str> = accels.iter().map(String::as_str).collect();
-        app.set_accels_for_action(action_name, &accel_refs);
-    }
-
     app.run();
 }
 
