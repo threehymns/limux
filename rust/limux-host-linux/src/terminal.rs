@@ -1,14 +1,17 @@
 use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
+use shell_quote::Bash;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
+use std::os::unix::ffi::OsStringExt;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use limux_ghostty_sys::*;
 
@@ -29,6 +32,7 @@ static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
 type VoidCallback = dyn Fn();
+type WidgetCallback = dyn Fn(&gtk::Widget);
 
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
@@ -47,6 +51,110 @@ struct ClipboardContext {
 
 thread_local! {
     static SURFACE_MAP: RefCell<HashMap<usize, SurfaceEntry>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Clone)]
+pub struct TerminalHandle {
+    surface_cell: Rc<RefCell<Option<ghostty_surface_t>>>,
+    gl_area: gtk::GLArea,
+    search_bar: gtk::SearchBar,
+    search_entry: gtk::SearchEntry,
+}
+
+impl TerminalHandle {
+    pub fn perform_binding_action(&self, action: &str) -> bool {
+        let surface = *self.surface_cell.borrow();
+        surface_action(surface, action);
+        surface.is_some()
+    }
+
+    pub fn show_find(&self) -> bool {
+        self.search_bar.set_search_mode(true);
+        self.search_entry.grab_focus();
+        self.search_entry.select_region(0, -1);
+        if !self.search_entry.text().is_empty() {
+            self.apply_search_query(self.search_entry.text().as_str());
+        }
+        true
+    }
+
+    pub fn find_next(&self) -> bool {
+        if !self.search_bar.is_search_mode() || self.search_entry.text().is_empty() {
+            return false;
+        }
+        self.perform_binding_action("navigate_search:next")
+    }
+
+    pub fn find_previous(&self) -> bool {
+        if !self.search_bar.is_search_mode() || self.search_entry.text().is_empty() {
+            return false;
+        }
+        self.perform_binding_action("navigate_search:previous")
+    }
+
+    pub fn hide_find(&self) -> bool {
+        if !self.search_bar.is_search_mode() {
+            return false;
+        }
+        self.perform_binding_action("end_search");
+        self.search_bar.set_search_mode(false);
+        self.gl_area.grab_focus();
+        true
+    }
+
+    pub fn use_selection_for_find(&self) -> bool {
+        let selection = self.read_selection_text();
+        if selection.is_empty() {
+            return false;
+        }
+
+        self.search_bar.set_search_mode(true);
+        self.search_entry.set_text(&selection);
+        self.search_entry.grab_focus();
+        self.search_entry.select_region(0, -1);
+        self.apply_search_query(&selection);
+        true
+    }
+
+    fn apply_search_query(&self, query: &str) -> bool {
+        let surface = *self.surface_cell.borrow();
+        surface_action(surface, &terminal_search_action(query));
+        surface.is_some()
+    }
+
+    fn read_selection_text(&self) -> String {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return String::new();
+        };
+
+        let mut text = ghostty_text_s {
+            tl_px_x: 0.0,
+            tl_px_y: 0.0,
+            offset_start: 0,
+            offset_len: 0,
+            text: ptr::null(),
+            text_len: 0,
+        };
+
+        let has_selection = unsafe { ghostty_surface_read_selection(surface, &mut text) };
+        if !has_selection || text.text.is_null() || text.text_len == 0 {
+            return String::new();
+        }
+
+        let bytes = unsafe { std::slice::from_raw_parts(text.text as *const u8, text.text_len) };
+        let selection = String::from_utf8_lossy(bytes).into_owned();
+        unsafe { ghostty_surface_free_text(surface, &mut text) };
+        selection
+    }
+}
+
+pub struct TerminalWidget {
+    pub overlay: gtk::Overlay,
+    pub handle: TerminalHandle,
+}
+
+fn terminal_search_action(query: &str) -> String {
+    format!("search:{query}")
 }
 
 /// Initialize the global Ghostty app. Must be called once before creating surfaces.
@@ -368,6 +476,7 @@ pub struct TerminalCallbacks {
     pub on_close: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
     pub on_split_down: Box<VoidCallback>,
+    pub on_open_keybinds: Box<WidgetCallback>,
 }
 
 /// Create a new Ghostty-powered terminal widget.
@@ -375,7 +484,7 @@ pub struct TerminalCallbacks {
 pub fn create_terminal(
     working_directory: Option<&str>,
     callbacks: TerminalCallbacks,
-) -> gtk::Overlay {
+) -> TerminalWidget {
     let gl_area = gtk::GLArea::new();
     gl_area.set_hexpand(true);
     gl_area.set_vexpand(true);
@@ -398,6 +507,42 @@ pub fn create_terminal(
     overlay.set_child(Some(&gl_area));
     overlay.set_hexpand(true);
     overlay.set_vexpand(true);
+
+    let search_entry = gtk::SearchEntry::builder()
+        .hexpand(true)
+        .placeholder_text("Find in terminal")
+        .build();
+    let search_bar = gtk::SearchBar::new();
+    search_bar.set_show_close_button(true);
+    search_bar.connect_entry(&search_entry);
+    search_bar.set_child(Some(&search_entry));
+    search_bar.set_key_capture_widget(Some(&gl_area));
+    search_bar.set_valign(gtk::Align::Start);
+    search_bar.set_halign(gtk::Align::Fill);
+    search_bar.set_margin_top(8);
+    search_bar.set_margin_start(8);
+    search_bar.set_margin_end(8);
+    overlay.add_overlay(&search_bar);
+
+    let handle = TerminalHandle {
+        surface_cell: surface_cell.clone(),
+        gl_area: gl_area.clone(),
+        search_bar: search_bar.clone(),
+        search_entry: search_entry.clone(),
+    };
+
+    {
+        let handle = handle.clone();
+        search_entry.connect_search_changed(move |entry| {
+            handle.apply_search_query(entry.text().as_str());
+        });
+    }
+    {
+        let handle = handle.clone();
+        search_entry.connect_stop_search(move |_| {
+            handle.hide_find();
+        });
+    }
 
     // On realize: create the Ghostty surface
     {
@@ -732,6 +877,33 @@ pub fn create_terminal(
         gl_area.add_controller(focus_ctrl);
     }
 
+    // File drop: accept files dragged from a file manager and paste their
+    // shell-escaped paths into the terminal.
+    {
+        let surface_cell = surface_cell.clone();
+        let drop_target = gtk::DropTarget::new(
+            gtk::gdk::FileList::static_type(),
+            gtk::gdk::DragAction::COPY,
+        );
+        drop_target.connect_drop(move |_target, value, _x, _y| {
+            let Some(surface) = *surface_cell.borrow() else {
+                return false;
+            };
+            let Ok(file_list) = value.get::<gtk::gdk::FileList>() else {
+                return false;
+            };
+            let Some(text) = dropped_file_text(&file_list) else {
+                return false;
+            };
+
+            unsafe {
+                ghostty_surface_text(surface, text.as_ptr(), text.as_bytes().len());
+            }
+            true
+        });
+        gl_area.add_controller(drop_target);
+    }
+
     // On unrealize: deinit GL resources but keep the surface alive.
     // GTK unrealizes widgets during reparenting (splits), and we need
     // the terminal/pty to survive. The GL resources will be recreated
@@ -772,7 +944,7 @@ pub fn create_terminal(
         });
     }
 
-    overlay
+    TerminalWidget { overlay, handle }
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +982,7 @@ fn show_terminal_context_menu(
         ("---", false),
         ("Split Right", true),
         ("Split Down", true),
+        ("Keybinds", true),
         ("---", false),
         ("Clear", true),
     ];
@@ -846,6 +1019,7 @@ fn show_terminal_context_menu(
             let label = btn.label().unwrap_or_default().to_string();
             let pop = popover.clone();
             let cb = callbacks.clone();
+            let gl_area = gl_area.clone();
 
             btn.connect_clicked(move |_| {
                 pop.popdown();
@@ -854,6 +1028,13 @@ fn show_terminal_context_menu(
                     "Paste" => surface_action(surface, "paste_from_clipboard"),
                     "Split Right" => (cb.on_split_right)(),
                     "Split Down" => (cb.on_split_down)(),
+                    "Keybinds" => {
+                        let anchor: gtk::Widget = gl_area.clone().upcast();
+                        let cb = cb.clone();
+                        glib::timeout_add_local_once(Duration::from_millis(80), move || {
+                            (cb.on_open_keybinds)(&anchor);
+                        });
+                    }
                     "Clear" => surface_action(surface, "clear_screen"),
                     _ => {}
                 }
@@ -1056,6 +1237,43 @@ fn show_clipboard_toast(overlay: &gtk::Overlay) {
     }
 }
 
+fn dropped_file_text(file_list: &gtk::gdk::FileList) -> Option<CString> {
+    shell_escape_joined_bytes(
+        file_list
+            .files()
+            .iter()
+            .filter_map(|file| file.path())
+            .map(|path| path.into_os_string().into_vec()),
+    )
+}
+
+/// Bash-escape a path so it can be safely pasted into the terminal without
+/// sending raw control bytes to Ghostty.
+fn shell_escape_bytes(s: &[u8]) -> Vec<u8> {
+    Bash::quote_vec(s)
+}
+
+fn shell_escape_joined_bytes<I, B>(paths: I) -> Option<CString>
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
+    let mut text = Vec::new();
+
+    for path in paths {
+        if !text.is_empty() {
+            text.push(b' ');
+        }
+        text.extend(shell_escape_bytes(path.as_ref()));
+    }
+
+    if text.is_empty() {
+        return None;
+    }
+
+    CString::new(text).ok()
+}
+
 fn translate_mouse_mods(state: gtk::gdk::ModifierType) -> c_int {
     let mut mods: c_int = GHOSTTY_MODS_NONE;
     if state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
@@ -1107,6 +1325,13 @@ mod tests {
     }
 
     #[test]
+    fn terminal_search_action_formats_queries_for_ghostty() {
+        assert_eq!(terminal_search_action(""), "search:");
+        assert_eq!(terminal_search_action("needle"), "search:needle");
+        assert_eq!(terminal_search_action("two words"), "search:two words");
+    }
+
+    #[test]
     fn key_event_text_preserves_printable_chords() {
         let ctrl_shift_h = key_event_text(gtk::gdk::Key::H).and_then(|s| s.into_string().ok());
         let alt_shift_gt =
@@ -1115,5 +1340,70 @@ mod tests {
         assert_eq!(ctrl_shift_h.as_deref(), Some("H"));
         assert_eq!(alt_shift_gt.as_deref(), Some(">"));
         assert!(key_event_text(gtk::gdk::Key::BackSpace).is_none());
+    }
+
+    #[test]
+    fn shell_escape_preserves_simple_paths() {
+        assert_eq!(
+            shell_escape_bytes(b"/home/user/file.txt"),
+            b"/home/user/file.txt"
+        );
+        assert_eq!(shell_escape_bytes(b"/tmp/a-b_c.rs"), b"/tmp/a-b_c.rs");
+    }
+
+    #[test]
+    fn shell_escape_quotes_paths_with_spaces() {
+        assert_eq!(
+            shell_escape_bytes(b"/home/user/my file.txt"),
+            b"$'/home/user/my file.txt'"
+        );
+    }
+
+    #[test]
+    fn shell_escape_handles_single_quotes() {
+        assert_eq!(
+            shell_escape_bytes(b"/tmp/it's a file"),
+            b"$'/tmp/it\\'s a file'"
+        );
+    }
+
+    #[test]
+    fn shell_escape_preserves_non_utf8_bytes() {
+        let path = b"/home/user/\xff\xfefile.txt";
+        assert_eq!(
+            shell_escape_bytes(path),
+            b"$'/home/user/\\xFF\\xFEfile.txt'"
+        );
+    }
+
+    #[test]
+    fn shell_escape_hex_escapes_terminal_control_bytes() {
+        let path = b"/tmp/line\nbreak\tand\x03escape\x1b";
+        assert_eq!(
+            shell_escape_bytes(path),
+            b"$'/tmp/line\\nbreak\\tand\\x03escape\\e'"
+        );
+    }
+
+    #[test]
+    fn shell_escape_joins_multiple_paths_for_terminal_drop() {
+        let text = shell_escape_joined_bytes([
+            b"/tmp/plain".as_slice(),
+            b"/tmp/space name".as_slice(),
+            b"/tmp/it's".as_slice(),
+            b"/tmp/\xff\xfe".as_slice(),
+            b"/tmp/line\nbreak".as_slice(),
+        ])
+        .expect("drop payload must be NUL-free");
+
+        assert_eq!(
+            text.as_bytes(),
+            b"/tmp/plain $'/tmp/space name' $'/tmp/it\\'s' $'/tmp/\\xFF\\xFE' $'/tmp/line\\nbreak'"
+        );
+    }
+
+    #[test]
+    fn shell_escape_joined_bytes_rejects_empty_input() {
+        assert!(shell_escape_joined_bytes(std::iter::empty::<&[u8]>()).is_none());
     }
 }
