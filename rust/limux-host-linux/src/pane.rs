@@ -12,7 +12,9 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 
+use crate::keybind_editor;
 use crate::layout_state::{PaneState, TabContentState, TabState as SavedTabState};
+use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 use crate::terminal::{self, TerminalCallbacks};
 
 // ---------------------------------------------------------------------------
@@ -117,6 +119,9 @@ type PaneSplitCallback = dyn Fn(&gtk::Widget, gtk::Orientation);
 type PaneWidgetCallback = dyn Fn(&gtk::Widget);
 type PaneSignalCallback = dyn Fn();
 type PanePathCallback = dyn Fn(&str);
+type PaneShortcutStateCallback = dyn Fn() -> Rc<ResolvedShortcutConfig>;
+type PaneShortcutCaptureCallback =
+    dyn Fn(ShortcutId, NormalizedShortcut) -> Result<ResolvedShortcutConfig, String>;
 
 type PaneSplitWithTabCallback = dyn Fn(&gtk::Widget, &gtk::Widget, gtk::Orientation, String, bool);
 
@@ -124,6 +129,9 @@ pub struct PaneCallbacks {
     pub on_split: Box<PaneSplitCallback>,
     pub on_close_pane: Box<PaneWidgetCallback>,
     pub on_bell: Box<PaneSignalCallback>,
+    pub on_open_keybinds: Box<PaneWidgetCallback>,
+    pub current_shortcuts: Box<PaneShortcutStateCallback>,
+    pub on_capture_shortcut: Rc<PaneShortcutCaptureCallback>,
     pub on_pwd_changed: Box<PanePathCallback>,
     pub on_empty: Box<PaneWidgetCallback>,
     pub on_state_changed: Box<PaneSignalCallback>,
@@ -494,6 +502,7 @@ pub fn install_content_drop_overlay(pane_outer: &gtk::Box) {
 
 pub fn create_pane(
     callbacks: Rc<PaneCallbacks>,
+    shortcuts: Rc<ResolvedShortcutConfig>,
     working_directory: Option<&str>,
     initial_state: Option<&PaneState>,
     skip_default_tab: bool,
@@ -550,11 +559,30 @@ pub fn create_pane(
         .spacing(1)
         .build();
 
-    let new_term_btn = icon_button("utilities-terminal-symbolic", "New terminal tab");
-    let new_browser_btn = icon_button("limux-globe-symbolic", "New browser tab");
-    let split_h_btn = icon_button("limux-split-horizontal-symbolic", "Split right");
-    let split_v_btn = icon_button("limux-split-vertical-symbolic", "Split down");
-    let close_btn = icon_button("window-close-symbolic", "Close pane");
+    let new_term_btn = icon_button(
+        "utilities-terminal-symbolic",
+        &pane_action_tooltip(
+            &shortcuts,
+            "New terminal tab",
+            Some(ShortcutId::NewTerminal),
+        ),
+    );
+    let new_browser_btn = icon_button(
+        "limux-globe-symbolic",
+        &pane_action_tooltip(&shortcuts, "New browser tab", None),
+    );
+    let split_h_btn = icon_button(
+        "limux-split-horizontal-symbolic",
+        &pane_action_tooltip(&shortcuts, "Split right", Some(ShortcutId::SplitRight)),
+    );
+    let split_v_btn = icon_button(
+        "limux-split-vertical-symbolic",
+        &pane_action_tooltip(&shortcuts, "Split down", Some(ShortcutId::SplitDown)),
+    );
+    let close_btn = icon_button(
+        "window-close-symbolic",
+        &pane_action_tooltip(&shortcuts, "Close pane", Some(ShortcutId::CloseFocusedPane)),
+    );
 
     actions.append(&new_term_btn);
     actions.append(&new_browser_btn);
@@ -589,6 +617,10 @@ pub fn create_pane(
         working_directory: ws_wd.clone(),
         drop_indicator: drop_indicator.clone(),
         workspace_dragging: workspace_dragging.clone(),
+        new_terminal_button: new_term_btn.clone(),
+        split_right_button: split_h_btn.clone(),
+        split_down_button: split_v_btn.clone(),
+        close_pane_button: close_btn.clone(),
     });
 
     // Unified drop target on tab_overlay — determines insertion index from
@@ -703,7 +735,7 @@ pub fn create_pane(
         });
     }
 
-    // Store internals on the outer widget so external code to cycle tabs
+    // Register pane in global registry for cross-pane tab DnD
     register_pane(pane_id, &internals);
     unsafe {
         outer.set_data("limux-pane-internals", internals);
@@ -764,6 +796,7 @@ pub fn cycle_tab_in_pane(pane_widget: &gtk::Widget, delta: i32) {
 enum TabKind {
     Terminal { cwd: Rc<RefCell<Option<String>>> },
     Browser { uri: Rc<RefCell<Option<String>>> },
+    Keybinds,
 }
 
 struct TabEntry {
@@ -793,6 +826,10 @@ pub struct PaneInternals {
     working_directory: Rc<std::cell::RefCell<Option<String>>>,
     drop_indicator: gtk::Box,
     pub workspace_dragging: Rc<Cell<bool>>,
+    pub new_terminal_button: gtk::Button,
+    pub split_right_button: gtk::Button,
+    pub split_down_button: gtk::Button,
+    pub close_pane_button: gtk::Button,
 }
 
 impl TabState {
@@ -817,6 +854,16 @@ fn icon_button(icon_name: &str, tooltip: &str) -> gtk::Button {
         .build();
     btn.add_css_class("limux-pane-action");
     btn
+}
+
+fn pane_action_tooltip(
+    shortcuts: &ResolvedShortcutConfig,
+    base: &str,
+    shortcut_id: Option<ShortcutId>,
+) -> String {
+    shortcut_id
+        .map(|id| shortcuts.tooltip_text(id, base))
+        .unwrap_or_else(|| base.to_string())
 }
 
 /// Create a split-pane icon button with two rectangles separated by a divider.
@@ -864,6 +911,12 @@ struct BrowserTabOptions<'a> {
     uri: Option<&'a str>,
 }
 
+struct KeybindsTabOptions<'a> {
+    id: Option<&'a str>,
+    custom_name: Option<&'a str>,
+    pinned: bool,
+}
+
 fn restore_tabs_from_state(
     internals: &Rc<PaneInternals>,
     working_directory: Option<&str>,
@@ -896,6 +949,16 @@ fn restore_tabs_from_state(
                     custom_name: saved_tab.custom_name.as_deref(),
                     pinned: saved_tab.pinned,
                     uri: uri.as_deref(),
+                }),
+            ),
+            TabContentState::Keybinds {} => add_keybind_editor_tab_inner(
+                internals,
+                (internals.callbacks.current_shortcuts)(),
+                internals.callbacks.on_capture_shortcut.clone(),
+                Some(KeybindsTabOptions {
+                    id: Some(saved_tab.id.as_str()),
+                    custom_name: saved_tab.custom_name.as_deref(),
+                    pinned: saved_tab.pinned,
                 }),
             ),
         }
@@ -1023,6 +1086,15 @@ fn add_terminal_tab_inner(
                     (cb.on_split)(&w, gtk::Orientation::Vertical);
                 }
             }),
+            on_open_keybinds: Box::new({
+                let cb = internals.callbacks.clone();
+                let po = internals.pane_outer.clone();
+                move |anchor| {
+                    let _ = anchor;
+                    let pane_widget: gtk::Widget = po.clone().upcast();
+                    (cb.on_open_keybinds)(&pane_widget);
+                }
+            }),
         }
     };
 
@@ -1144,6 +1216,63 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
     }
 }
 
+fn add_keybind_editor_tab_inner(
+    internals: &Rc<PaneInternals>,
+    shortcuts: Rc<ResolvedShortcutConfig>,
+    on_capture: Rc<PaneShortcutCaptureCallback>,
+    options: Option<KeybindsTabOptions<'_>>,
+) {
+    let tab_id = options
+        .as_ref()
+        .and_then(|value| value.id.map(|id| id.to_string()))
+        .unwrap_or_else(next_tab_id);
+
+    let (tab_btn, title_label) = build_tab_button("Keybinds", &tab_id, internals);
+
+    let widget = keybind_editor::build_keybind_editor(&shortcuts, on_capture);
+    internals.content_stack.add_named(&widget, Some(&tab_id));
+
+    {
+        let mut ts = internals.tab_state.borrow_mut();
+        ts.tabs.push(TabEntry {
+            id: tab_id.clone(),
+            tab_button: tab_btn,
+            title_label: title_label.clone(),
+            content: widget,
+            custom_name: options
+                .as_ref()
+                .and_then(|value| value.custom_name.map(|name| name.to_string())),
+            pinned: options.as_ref().map(|value| value.pinned).unwrap_or(false),
+            kind: TabKind::Keybinds,
+        });
+    }
+
+    if let Some(custom_name) = options.as_ref().and_then(|value| value.custom_name) {
+        title_label.set_label(custom_name);
+    }
+    if options.as_ref().map(|value| value.pinned).unwrap_or(false) {
+        if let Some(entry) = internals
+            .tab_state
+            .borrow()
+            .tabs
+            .iter()
+            .find(|entry| entry.id == tab_id)
+        {
+            apply_pin_visuals(&entry.tab_button, true);
+        }
+    }
+
+    activate_tab(
+        &internals.tab_strip,
+        &internals.content_stack,
+        &internals.tab_state,
+        &tab_id,
+    );
+    if options.is_none() {
+        (internals.callbacks.on_state_changed)();
+    }
+}
+
 // Public wrappers for keyboard shortcut use
 #[allow(dead_code)]
 pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
@@ -1160,6 +1289,69 @@ pub fn add_browser_tab_to_pane(pane_widget: &gtk::Widget) {
     }
 }
 
+pub fn add_keybind_editor_tab_to_pane(
+    pane_widget: &gtk::Widget,
+    shortcuts: Rc<ResolvedShortcutConfig>,
+    on_capture: Rc<PaneShortcutCaptureCallback>,
+) {
+    if let Some(internals) = find_pane_internals(pane_widget) {
+        if let Some(existing_id) = internals
+            .tab_state
+            .borrow()
+            .tabs
+            .iter()
+            .find(|entry| matches!(entry.kind, TabKind::Keybinds))
+            .map(|entry| entry.id.clone())
+        {
+            activate_tab(
+                &internals.tab_strip,
+                &internals.content_stack,
+                &internals.tab_state,
+                &existing_id,
+            );
+            (internals.callbacks.on_state_changed)();
+            return;
+        }
+
+        add_keybind_editor_tab_inner(&internals, shortcuts, on_capture, None);
+    }
+}
+
+pub fn refresh_shortcut_tooltips(pane_widget: &gtk::Widget, shortcuts: &ResolvedShortcutConfig) {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return;
+    };
+
+    internals
+        .new_terminal_button
+        .set_tooltip_text(Some(&pane_action_tooltip(
+            shortcuts,
+            "New terminal tab",
+            Some(ShortcutId::NewTerminal),
+        )));
+    internals
+        .split_right_button
+        .set_tooltip_text(Some(&pane_action_tooltip(
+            shortcuts,
+            "Split right",
+            Some(ShortcutId::SplitRight),
+        )));
+    internals
+        .split_down_button
+        .set_tooltip_text(Some(&pane_action_tooltip(
+            shortcuts,
+            "Split down",
+            Some(ShortcutId::SplitDown),
+        )));
+    internals
+        .close_pane_button
+        .set_tooltip_text(Some(&pane_action_tooltip(
+            shortcuts,
+            "Close pane",
+            Some(ShortcutId::CloseFocusedPane),
+        )));
+}
+
 pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
     let internals = find_pane_internals(pane_widget)?;
     let ts = internals.tab_state.borrow();
@@ -1174,6 +1366,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
                 TabKind::Browser { uri } => TabContentState::Browser {
                     uri: uri.borrow().clone(),
                 },
+                TabKind::Keybinds => TabContentState::Keybinds {},
             };
             SavedTabState {
                 id: entry.id.clone(),
@@ -1232,7 +1425,7 @@ pub fn tab_working_directory(pane_widget: &gtk::Widget, tab_id: &str) -> Option<
     let entry = tab_state.tabs.iter().find(|t| t.id == tab_id)?;
     match &entry.kind {
         TabKind::Terminal { cwd } => cwd.borrow().clone(),
-        TabKind::Browser { .. } => None,
+        TabKind::Browser { .. } | TabKind::Keybinds => None,
     }
 }
 
@@ -2047,4 +2240,49 @@ fn create_browser_widget(
     placeholder.set_vexpand(true);
 
     (placeholder.upcast(), "Browser".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pane_action_tooltip;
+    use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
+
+    #[test]
+    fn pane_action_tooltip_reflects_remaps_and_unbinds() {
+        let defaults = default_shortcuts();
+        assert_eq!(
+            pane_action_tooltip(&defaults, "New terminal tab", Some(ShortcutId::NewTerminal)),
+            "New terminal tab (Ctrl+T)"
+        );
+        assert_eq!(
+            pane_action_tooltip(&defaults, "New browser tab", None),
+            "New browser tab"
+        );
+
+        let remapped = resolve_shortcuts_from_str(
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Ctrl><Alt>d"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pane_action_tooltip(&remapped, "Split right", Some(ShortcutId::SplitRight)),
+            "Split right (Ctrl+Alt+D)"
+        );
+
+        let unbound = resolve_shortcuts_from_str(
+            r#"{
+                "shortcuts": {
+                    "close_focused_pane": null
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pane_action_tooltip(&unbound, "Close pane", Some(ShortcutId::CloseFocusedPane)),
+            "Close pane"
+        );
+    }
 }
