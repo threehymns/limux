@@ -87,7 +87,6 @@ pub fn build_keybind_editor(
         dyn Fn(ShortcutId, NormalizedShortcut) -> Result<ResolvedShortcutConfig, String>,
     >,
 ) -> gtk::Widget {
-
     let state = Rc::new(RefCell::new(shortcuts.clone()));
     let listening = Rc::new(RefCell::new(None::<ShortcutId>));
     let errors = Rc::new(RefCell::new(HashMap::<ShortcutId, String>::new()));
