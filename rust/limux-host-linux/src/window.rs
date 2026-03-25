@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::gdk::prelude::ToplevelExt;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
@@ -12,7 +13,9 @@ use crate::layout_state::{
     WorkspaceState,
 };
 use crate::pane::{self, PaneCallbacks};
-use crate::shortcut_config::{self, ResolvedShortcutConfig, ShortcutCommand, ShortcutId};
+use crate::shortcut_config::{
+    self, EditableCapturePolicy, ResolvedShortcutConfig, ShortcutCommand, ShortcutId,
+};
 
 // ---------------------------------------------------------------------------
 // State
@@ -48,6 +51,9 @@ struct Workspace {
 
 struct AppState {
     app: adw::Application,
+    window: adw::ApplicationWindow,
+    top_bar: Option<adw::HeaderBar>,
+    top_bar_visible: bool,
     workspaces: Vec<Workspace>,
     active_idx: usize,
     shortcuts: Rc<ResolvedShortcutConfig>,
@@ -55,8 +61,6 @@ struct AppState {
     sidebar_list: gtk::ListBox,
     paned: gtk::Paned,
     new_ws_btn: gtk::Button,
-    collapse_btn: gtk::Button,
-    expand_btn: gtk::Button,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
@@ -124,6 +128,8 @@ fn suspend_persistence(state: &State, suspended: bool) {
 fn apply_loaded_session(state: &State, loaded: LoadedSession) {
     suspend_persistence(state, true);
 
+    apply_top_bar_state_immediately(state, loaded.state.top_bar_visible);
+
     let restored_any = !loaded.state.workspaces.is_empty();
     if restored_any {
         for workspace in &loaded.state.workspaces {
@@ -162,32 +168,30 @@ fn restore_active_workspace(state: &State, index: usize) {
 }
 
 fn apply_sidebar_state_immediately(state: &State, sidebar_state: &layout_state::SidebarState) {
-    let (paned, expand_btn, sidebar, width) = {
+    let (paned, sidebar, width) = {
         let mut s = state.borrow_mut();
         s.sidebar_expanded_width = sidebar_state.width.max(SIDEBAR_WIDTH);
         let sidebar = match s.paned.start_child() {
             Some(sidebar) => sidebar,
             None => return,
         };
-        (
-            s.paned.clone(),
-            s.expand_btn.clone(),
-            sidebar,
-            s.sidebar_expanded_width,
-        )
+        (s.paned.clone(), sidebar, s.sidebar_expanded_width)
     };
 
     if sidebar_state.visible {
         sidebar.set_visible(true);
         paned.set_position(width);
-        expand_btn.set_visible(false);
     } else {
         // Apply restored sidebar visibility directly; using the animated toggle path during
         // startup would create flicker and extra persistence churn while restore is suspended.
         sidebar.set_visible(false);
         paned.set_position(0);
-        expand_btn.set_visible(true);
     }
+}
+
+fn apply_top_bar_state_immediately(state: &State, visible: bool) {
+    state.borrow_mut().top_bar_visible = visible;
+    sync_top_bar_visibility(state);
 }
 
 fn snapshot_session_state(state: &State) -> AppSessionState {
@@ -220,6 +224,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
     layout_state::normalize_session(AppSessionState {
         version: layout_state::SESSION_VERSION,
         active_workspace_index: s.active_idx,
+        top_bar_visible: s.top_bar_visible,
         sidebar: layout_state::SidebarState {
             visible: sidebar_visible,
             width: sidebar_width,
@@ -234,6 +239,27 @@ fn sidebar_is_visible(state: &AppState) -> bool {
         .start_child()
         .map(|sidebar| sidebar.is_visible() && state.paned.position() > 10)
         .unwrap_or(false)
+}
+
+fn begin_window_move_from_widget(
+    widget: &impl IsA<gtk::Widget>,
+    window: &adw::ApplicationWindow,
+    device: &gtk::gdk::Device,
+    button: i32,
+    x: f64,
+    y: f64,
+    timestamp: u32,
+) {
+    let Some((surface_x, surface_y)) = widget.translate_coordinates(window, x, y) else {
+        return;
+    };
+    let Some(surface) = window.surface() else {
+        return;
+    };
+    let Ok(toplevel) = surface.dynamic_cast::<gtk::gdk::Toplevel>() else {
+        return;
+    };
+    toplevel.begin_move(device, button, surface_x, surface_y, timestamp);
 }
 
 fn split_ratio_state(paned: &gtk::Paned) -> Option<Rc<RefCell<f64>>> {
@@ -672,11 +698,6 @@ pub fn build_window(app: &adw::Application) {
         .build();
     sidebar_title_label.add_css_class("limux-sidebar-title");
 
-    let collapse_btn = gtk::Button::with_label("\u{00AB}"); // «
-    collapse_btn.add_css_class("flat");
-    collapse_btn.add_css_class("limux-sidebar-collapse");
-    collapse_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts, true)));
-
     let sidebar_title = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .margin_top(8)
@@ -684,7 +705,23 @@ pub fn build_window(app: &adw::Application) {
         .margin_end(6)
         .build();
     sidebar_title.append(&sidebar_title_label);
-    sidebar_title.append(&collapse_btn);
+
+    {
+        let window = window.clone();
+        let drag_title = sidebar_title.clone();
+        let drag = gtk::GestureClick::new();
+        drag.set_button(1);
+        drag.connect_pressed(move |gesture, _, x, y| {
+            let Some(device) = gesture.current_event_device() else {
+                return;
+            };
+            let button = gesture.current_button() as i32;
+            let timestamp = gesture.current_event_time();
+            begin_window_move_from_widget(&drag_title, &window, &device, button, x, y, timestamp);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        sidebar_title.add_controller(drag);
+    }
 
     let new_ws_btn = gtk::Button::builder()
         .label("New Workspace")
@@ -737,27 +774,18 @@ pub fn build_window(app: &adw::Application) {
         .end_child(&stack)
         .build();
 
-    // Expand tab — small button on the left edge when sidebar is hidden
-    let expand_btn = gtk::Button::with_label("\u{00BB}"); // »
-    expand_btn.add_css_class("limux-sidebar-expand");
-    expand_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts, false)));
-    expand_btn.set_valign(gtk::Align::Center);
-    expand_btn.set_halign(gtk::Align::Start);
-    expand_btn.set_visible(false);
-
-    let content_overlay = gtk::Overlay::new();
-    content_overlay.set_child(Some(&main_paned));
-    content_overlay.add_overlay(&expand_btn);
-
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     if let Some(ref header) = header {
         vbox.append(header);
     }
-    vbox.append(&content_overlay);
+    vbox.append(&main_paned);
     window.set_content(Some(&vbox));
 
     let state: State = Rc::new(RefCell::new(AppState {
         app: app.clone(),
+        window: window.clone(),
+        top_bar: header.clone(),
+        top_bar_visible: true,
         workspaces: Vec::new(),
         active_idx: 0,
         shortcuts,
@@ -765,8 +793,6 @@ pub fn build_window(app: &adw::Application) {
         sidebar_list: sidebar_list.clone(),
         paned: main_paned.clone(),
         new_ws_btn: new_ws_btn.clone(),
-        collapse_btn: collapse_btn.clone(),
-        expand_btn: expand_btn.clone(),
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
@@ -776,6 +802,13 @@ pub fn build_window(app: &adw::Application) {
     }));
 
     apply_shortcuts_to_application(app, &state.borrow().shortcuts);
+
+    {
+        let state = state.clone();
+        window.connect_fullscreened_notify(move |_| {
+            sync_top_bar_visibility(&state);
+        });
+    }
 
     {
         let state = state.clone();
@@ -795,23 +828,8 @@ pub fn build_window(app: &adw::Application) {
         });
     }
 
-    // Wire collapse button
-    {
-        let state = state.clone();
-        collapse_btn.connect_clicked(move |_| {
-            toggle_sidebar(&state);
-        });
-    }
-
-    // Wire expand button
-    {
-        let state = state.clone();
-        expand_btn.connect_clicked(move |_| {
-            toggle_sidebar(&state);
-        });
-    }
-
-    register_actions(&window, &state);
+    register_app_actions(app, &state);
+    register_window_actions(&window, &state);
     install_key_capture(&window, &state);
 
     // Any click anywhere in the window commits an active sidebar rename,
@@ -913,19 +931,16 @@ pub fn build_window(app: &adw::Application) {
 // Actions
 // ---------------------------------------------------------------------------
 
-fn register_actions(window: &adw::ApplicationWindow, state: &State) {
+fn register_window_actions(window: &adw::ApplicationWindow, state: &State) {
     let action_defs: Vec<(&'static str, ShortcutCommand)> = {
         let s = state.borrow();
         s.shortcuts
             .shortcuts
             .iter()
+            .filter(|shortcut| shortcut.definition.action_name.starts_with("win."))
             .map(|shortcut| {
                 (
-                    shortcut
-                        .definition
-                        .action_name
-                        .strip_prefix("win.")
-                        .unwrap_or(shortcut.definition.action_name),
+                    shortcut.definition.action_basename(),
                     shortcut.definition.command,
                 )
             })
@@ -942,6 +957,35 @@ fn register_actions(window: &adw::ApplicationWindow, state: &State) {
     }
 }
 
+fn register_app_actions(app: &adw::Application, state: &State) {
+    let action_defs: Vec<(&'static str, ShortcutCommand)> = {
+        let s = state.borrow();
+        s.shortcuts
+            .shortcuts
+            .iter()
+            .filter(|shortcut| shortcut.definition.action_name.starts_with("app."))
+            .map(|shortcut| {
+                (
+                    shortcut.definition.action_basename(),
+                    shortcut.definition.command,
+                )
+            })
+            .collect()
+    };
+
+    for (name, command) in action_defs {
+        if app.lookup_action(name).is_some() {
+            continue;
+        }
+        let action = gtk::gio::SimpleAction::new(name, None);
+        let state = state.clone();
+        action.connect_activate(move |_, _| {
+            dispatch_shortcut_command(&state, command);
+        });
+        app.add_action(&action);
+    }
+}
+
 /// Intercept keyboard shortcuts in the CAPTURE phase for window-level bindings.
 fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
     let key_controller = gtk::EventControllerKey::new();
@@ -949,31 +993,108 @@ fn install_key_capture(window: &adw::ApplicationWindow, state: &State) {
 
     let state = state.clone();
     key_controller.connect_key_pressed(move |controller, keyval, keycode, modifier| {
+        let focused_listening_editor = controller
+            .widget()
+            .and_then(|widget| widget.downcast::<gtk::Window>().ok())
+            .map(|window| focused_widget_is_listening_for_keybind_capture(&window))
+            .unwrap_or(false);
+        if focused_listening_editor {
+            return glib::Propagation::Proceed;
+        }
+
         let matched = {
             let s = state.borrow();
             let display = controller.widget().map(|widget| widget.display());
-            shortcut_command_from_key_press(
-                &s.shortcuts,
-                display.as_ref(),
-                keyval,
-                keycode,
-                modifier,
-            )
+            shortcut_match_from_key_press(&s.shortcuts, display.as_ref(), keyval, keycode, modifier)
         }
-        .map(|command| {
-            dispatch_shortcut_command(&state, command);
-            true
+        .filter(|matched| {
+            let context = controller
+                .widget()
+                .and_then(|widget| widget.downcast::<gtk::Window>().ok())
+                .map(|window| focused_editable_capture_context(&state, &window))
+                .unwrap_or_default();
+            !shortcut_blocked_by_editable(matched.command, matched.editable_capture_policy, context)
         })
+        .map(|matched| dispatch_shortcut_command(&state, matched.command))
         .unwrap_or(false);
 
-        if matched {
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
+        shortcut_dispatch_propagation(matched)
     });
 
     window.add_controller(key_controller);
+}
+
+fn focused_widget_is_listening_for_keybind_capture(window: &gtk::Window) -> bool {
+    let mut widget = gtk::prelude::GtkWindowExt::focus(window);
+    while let Some(current) = widget {
+        if current.has_css_class(keybind_editor::KEYBIND_EDITOR_LISTENING_CSS) {
+            return true;
+        }
+        widget = current.parent();
+    }
+    false
+}
+
+fn focused_widget_is_editable(window: &gtk::Window) -> bool {
+    let mut widget = gtk::prelude::GtkWindowExt::focus(window);
+    while let Some(current) = widget {
+        if current.is::<gtk::Entry>()
+            || current.is::<gtk::SearchEntry>()
+            || current.is::<gtk::TextView>()
+        {
+            return true;
+        }
+        widget = current.parent();
+    }
+    false
+}
+
+fn focused_editable_capture_context(state: &State, window: &gtk::Window) -> EditableCaptureContext {
+    let gtk_editable = focused_widget_is_editable(window);
+    match focused_shortcut_target(state) {
+        pane::FocusedShortcutTarget::Browser(target) => EditableCaptureContext {
+            gtk_editable,
+            browser_dom_editable: target.is_page_editable(),
+            browser_find_active: target.is_find_active(),
+        },
+        _ => EditableCaptureContext {
+            gtk_editable,
+            ..EditableCaptureContext::default()
+        },
+    }
+}
+
+fn shortcut_allowed_while_browser_find_active(command: ShortcutCommand) -> bool {
+    matches!(
+        command,
+        ShortcutCommand::SurfaceFindNext
+            | ShortcutCommand::SurfaceFindPrevious
+            | ShortcutCommand::SurfaceFindHide
+    )
+}
+
+fn shortcut_blocked_by_editable(
+    command: ShortcutCommand,
+    policy: EditableCapturePolicy,
+    context: EditableCaptureContext,
+) -> bool {
+    if policy == EditableCapturePolicy::AlwaysCapture {
+        return false;
+    }
+
+    if context.browser_find_active && shortcut_allowed_while_browser_find_active(command) {
+        return false;
+    }
+
+    context.gtk_editable || context.browser_dom_editable
+}
+
+fn shortcut_dispatch_propagation(matched: bool) -> glib::Propagation {
+    if matched {
+        glib::Propagation::Stop
+    } else {
+        glib::Propagation::Proceed
+    }
 }
 
 #[cfg(test)]
@@ -987,47 +1108,169 @@ fn shortcut_command_from_key_event(
         .and_then(|combo| shortcuts.command_for_runtime_combo(&combo))
 }
 
-fn shortcut_command_from_key_press(
+struct MatchedShortcut {
+    command: ShortcutCommand,
+    editable_capture_policy: EditableCapturePolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EditableCaptureContext {
+    gtk_editable: bool,
+    browser_dom_editable: bool,
+    browser_find_active: bool,
+}
+
+fn shortcut_match_from_key_press(
     shortcuts: &ResolvedShortcutConfig,
     display: Option<&gtk::gdk::Display>,
     keyval: gtk::gdk::Key,
     keycode: u32,
     modifier: gtk::gdk::ModifierType,
-) -> Option<ShortcutCommand> {
+) -> Option<MatchedShortcut> {
     shortcut_config::NormalizedShortcut::from_gdk_key_event(display, keyval, keycode, modifier)
         .map(|shortcut| shortcut.to_runtime_combo())
-        .and_then(|combo| shortcuts.command_for_runtime_combo(&combo))
+        .and_then(|combo| shortcuts.shortcut_for_runtime_combo(&combo))
+        .map(|shortcut| MatchedShortcut {
+            command: shortcut.definition.command,
+            editable_capture_policy: shortcut.definition.editable_capture_policy,
+        })
 }
 
-fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) {
+fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
     match command {
-        ShortcutCommand::NewWorkspace => add_workspace(state, None),
-        ShortcutCommand::CloseWorkspace => close_workspace(state),
-        ShortcutCommand::ToggleSidebar => toggle_sidebar(state),
-        ShortcutCommand::NextWorkspace => cycle_workspace(state, 1),
-        ShortcutCommand::PrevWorkspace => cycle_workspace(state, -1),
-        ShortcutCommand::CycleTabPrev => cycle_focused_pane_tab(state, -1),
-        ShortcutCommand::CycleTabNext => cycle_focused_pane_tab(state, 1),
-        ShortcutCommand::SplitDown => split_focused_pane(state, gtk::Orientation::Vertical),
-        ShortcutCommand::NewTerminal => add_tab_to_focused_pane(state, false),
-        ShortcutCommand::SplitRight => split_focused_pane(state, gtk::Orientation::Horizontal),
-        ShortcutCommand::CloseFocusedPane => close_focused_tab(state),
-        ShortcutCommand::FocusLeft => focus_pane_in_direction(state, Direction::Left),
-        ShortcutCommand::FocusRight => focus_pane_in_direction(state, Direction::Right),
-        ShortcutCommand::FocusUp => focus_pane_in_direction(state, Direction::Up),
-        ShortcutCommand::FocusDown => focus_pane_in_direction(state, Direction::Down),
-        ShortcutCommand::ActivateWorkspace1 => activate_workspace_shortcut(state, 0),
-        ShortcutCommand::ActivateWorkspace2 => activate_workspace_shortcut(state, 1),
-        ShortcutCommand::ActivateWorkspace3 => activate_workspace_shortcut(state, 2),
-        ShortcutCommand::ActivateWorkspace4 => activate_workspace_shortcut(state, 3),
-        ShortcutCommand::ActivateWorkspace5 => activate_workspace_shortcut(state, 4),
-        ShortcutCommand::ActivateWorkspace6 => activate_workspace_shortcut(state, 5),
-        ShortcutCommand::ActivateWorkspace7 => activate_workspace_shortcut(state, 6),
-        ShortcutCommand::ActivateWorkspace8 => activate_workspace_shortcut(state, 7),
-        ShortcutCommand::ActivateLastWorkspace => activate_last_workspace_shortcut(state),
+        ShortcutCommand::NewWorkspace => {
+            add_workspace(state, None);
+            true
+        }
+        ShortcutCommand::CloseWorkspace => {
+            close_workspace(state);
+            true
+        }
+        ShortcutCommand::QuitApp => {
+            quit_app(state);
+            true
+        }
+        ShortcutCommand::NewInstance => spawn_new_instance(state),
+        ShortcutCommand::ToggleSidebar => {
+            toggle_sidebar(state);
+            true
+        }
+        ShortcutCommand::ToggleTopBar => {
+            toggle_top_bar(state);
+            true
+        }
+        ShortcutCommand::ToggleFullscreen => {
+            toggle_fullscreen(state);
+            true
+        }
+        ShortcutCommand::NextWorkspace => {
+            cycle_workspace(state, 1);
+            true
+        }
+        ShortcutCommand::PrevWorkspace => {
+            cycle_workspace(state, -1);
+            true
+        }
+        ShortcutCommand::CycleTabPrev => {
+            cycle_focused_pane_tab(state, -1);
+            true
+        }
+        ShortcutCommand::CycleTabNext => {
+            cycle_focused_pane_tab(state, 1);
+            true
+        }
+        ShortcutCommand::SplitDown => {
+            split_focused_pane(state, gtk::Orientation::Vertical);
+            true
+        }
+        ShortcutCommand::NewTerminal => {
+            add_tab_to_focused_pane(state, false);
+            true
+        }
+        ShortcutCommand::SplitRight => {
+            split_focused_pane(state, gtk::Orientation::Horizontal);
+            true
+        }
+        ShortcutCommand::CloseFocusedPane => {
+            close_focused_tab(state);
+            true
+        }
+        ShortcutCommand::FocusLeft => {
+            focus_pane_in_direction(state, Direction::Left);
+            true
+        }
+        ShortcutCommand::FocusRight => {
+            focus_pane_in_direction(state, Direction::Right);
+            true
+        }
+        ShortcutCommand::FocusUp => {
+            focus_pane_in_direction(state, Direction::Up);
+            true
+        }
+        ShortcutCommand::FocusDown => {
+            focus_pane_in_direction(state, Direction::Down);
+            true
+        }
+        ShortcutCommand::ActivateWorkspace1 => {
+            activate_workspace_shortcut(state, 0);
+            true
+        }
+        ShortcutCommand::ActivateWorkspace2 => {
+            activate_workspace_shortcut(state, 1);
+            true
+        }
+        ShortcutCommand::ActivateWorkspace3 => {
+            activate_workspace_shortcut(state, 2);
+            true
+        }
+        ShortcutCommand::ActivateWorkspace4 => {
+            activate_workspace_shortcut(state, 3);
+            true
+        }
+        ShortcutCommand::ActivateWorkspace5 => {
+            activate_workspace_shortcut(state, 4);
+            true
+        }
+        ShortcutCommand::ActivateWorkspace6 => {
+            activate_workspace_shortcut(state, 5);
+            true
+        }
+        ShortcutCommand::ActivateWorkspace7 => {
+            activate_workspace_shortcut(state, 6);
+            true
+        }
+        ShortcutCommand::ActivateWorkspace8 => {
+            activate_workspace_shortcut(state, 7);
+            true
+        }
+        ShortcutCommand::ActivateLastWorkspace => {
+            activate_last_workspace_shortcut(state);
+            true
+        }
+        ShortcutCommand::OpenBrowserInSplit
+        | ShortcutCommand::BrowserFocusLocation
+        | ShortcutCommand::BrowserBack
+        | ShortcutCommand::BrowserForward
+        | ShortcutCommand::BrowserReload
+        | ShortcutCommand::BrowserInspector
+        | ShortcutCommand::BrowserConsole => dispatch_browser_command(state, command),
+        ShortcutCommand::SurfaceFind
+        | ShortcutCommand::SurfaceFindNext
+        | ShortcutCommand::SurfaceFindPrevious
+        | ShortcutCommand::SurfaceFindHide
+        | ShortcutCommand::SurfaceUseSelectionForFind => {
+            dispatch_terminal_command(state, command) || dispatch_browser_command(state, command)
+        }
+        ShortcutCommand::TerminalClearScrollback
+        | ShortcutCommand::TerminalCopy
+        | ShortcutCommand::TerminalPaste
+        | ShortcutCommand::TerminalIncreaseFontSize
+        | ShortcutCommand::TerminalDecreaseFontSize
+        | ShortcutCommand::TerminalResetFontSize => dispatch_terminal_command(state, command),
     }
 }
 
+#[allow(dead_code)]
 fn sidebar_toggle_tooltip(shortcuts: &ResolvedShortcutConfig, visible: bool) -> String {
     let base = if visible {
         "Hide sidebar"
@@ -1045,13 +1288,11 @@ fn apply_shortcuts_to_application(app: &adw::Application, shortcuts: &ResolvedSh
 }
 
 fn apply_shortcut_config(state: &State, shortcuts: ResolvedShortcutConfig) {
-    let (app, collapse_btn, expand_btn, workspace_roots, shortcuts_rc) = {
+    let (app, workspace_roots, shortcuts_rc) = {
         let mut s = state.borrow_mut();
         s.shortcuts = Rc::new(shortcuts);
         (
             s.app.clone(),
-            s.collapse_btn.clone(),
-            s.expand_btn.clone(),
             s.workspaces
                 .iter()
                 .map(|ws| ws.root.clone())
@@ -1061,8 +1302,6 @@ fn apply_shortcut_config(state: &State, shortcuts: ResolvedShortcutConfig) {
     };
 
     apply_shortcuts_to_application(&app, &shortcuts_rc);
-    collapse_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts_rc, true)));
-    expand_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts_rc, false)));
     for root in workspace_roots {
         refresh_shortcut_tooltips_in_layout(&root, &shortcuts_rc);
     }
@@ -1085,12 +1324,12 @@ fn refresh_shortcut_tooltips_in_layout(widget: &gtk::Widget, shortcuts: &Resolve
 fn persist_shortcut_binding(
     state: &State,
     id: ShortcutId,
-    binding: shortcut_config::NormalizedShortcut,
+    binding: Option<shortcut_config::NormalizedShortcut>,
 ) -> Result<ResolvedShortcutConfig, String> {
     let updated = {
         let s = state.borrow();
         s.shortcuts
-            .with_binding(id, Some(binding))
+            .with_binding(id, binding)
             .map_err(|err| err.to_string())?
     };
 
@@ -1120,7 +1359,7 @@ fn open_keybind_editor_tab(state: &State, pane_widget: &gtk::Widget) {
     let on_capture: Rc<
         dyn Fn(
             ShortcutId,
-            shortcut_config::NormalizedShortcut,
+            Option<shortcut_config::NormalizedShortcut>,
         ) -> Result<ResolvedShortcutConfig, String>,
     > = {
         let state = state.clone();
@@ -2030,7 +2269,15 @@ fn create_pane_for_workspace(
 
     let callbacks = Rc::new(PaneCallbacks {
         on_split: Box::new(move |pane_widget, orientation| {
-            split_pane(&state_for_split, &ws_id_split, pane_widget, orientation);
+            split_pane(
+                &state_for_split,
+                &ws_id_split,
+                pane_widget,
+                orientation,
+                None,
+                false,
+                false,
+            );
         }),
         on_close_pane: Box::new(move |pane_widget| {
             remove_pane(&state_for_close, &ws_id_close, pane_widget);
@@ -2118,7 +2365,15 @@ fn handle_split_with_tab(
     let tab_id_owned = tab_id.to_string();
 
     // Split the pane — empty=true skips the default terminal tab
-    split_pane_inner(state, ws_id, pane_widget, orientation, true, new_pane_first);
+    split_pane(
+        state,
+        ws_id,
+        pane_widget,
+        orientation,
+        None,
+        true,
+        new_pane_first,
+    );
 
     // Move the dragged tab into the new pane
     let state_for_save = state.clone();
@@ -2251,8 +2506,41 @@ fn cycle_workspace(state: &State, direction: i32) {
 /// Default sidebar width in pixels.
 const SIDEBAR_WIDTH: i32 = 220;
 
+fn sync_top_bar_visibility(state: &State) {
+    let (top_bar, preferred_visible, fullscreened) = {
+        let s = state.borrow();
+        (
+            s.top_bar.clone(),
+            s.top_bar_visible,
+            gtk::prelude::GtkWindowExt::is_fullscreen(&s.window),
+        )
+    };
+
+    if let Some(top_bar) = top_bar {
+        top_bar.set_visible(preferred_visible && !fullscreened);
+    }
+}
+
+fn toggle_top_bar(state: &State) {
+    {
+        let mut s = state.borrow_mut();
+        s.top_bar_visible = !s.top_bar_visible;
+    }
+    sync_top_bar_visibility(state);
+    request_session_save(state);
+}
+
+fn toggle_fullscreen(state: &State) {
+    let window = state.borrow().window.clone();
+    if gtk::prelude::GtkWindowExt::is_fullscreen(&window) {
+        window.unfullscreen();
+    } else {
+        window.fullscreen();
+    }
+}
+
 fn toggle_sidebar(state: &State) {
-    let (paned, expand_btn, sidebar, current, is_visible, target_width, prior_animation, epoch) = {
+    let (paned, sidebar, current, is_visible, target_width, prior_animation, epoch) = {
         let mut s = state.borrow_mut();
         let Some(sidebar) = s.paned.start_child() else {
             return;
@@ -2267,7 +2555,6 @@ fn toggle_sidebar(state: &State) {
         s.sidebar_animation_epoch = s.sidebar_animation_epoch.wrapping_add(1);
         (
             s.paned.clone(),
-            s.expand_btn.clone(),
             sidebar,
             current,
             is_visible,
@@ -2282,8 +2569,7 @@ fn toggle_sidebar(state: &State) {
     }
 
     if is_visible {
-        // Collapse: animate position to 0, then hide sidebar, show expand button
-        expand_btn.set_visible(true);
+        // Collapse: animate position to 0, then hide sidebar
         let target = adw::CallbackAnimationTarget::new({
             let p = paned.clone();
             move |value| {
@@ -2299,7 +2585,6 @@ fn toggle_sidebar(state: &State) {
             .target(&target)
             .build();
         let state_for_done = state.clone();
-        let expand_btn_for_done = expand_btn.clone();
         animation.connect_done(move |_| {
             let is_current = {
                 let mut s = state_for_done.borrow_mut();
@@ -2312,7 +2597,6 @@ fn toggle_sidebar(state: &State) {
             };
             if is_current {
                 sidebar.set_visible(false);
-                expand_btn_for_done.set_visible(true);
                 request_session_save(&state_for_done);
             }
         });
@@ -2337,7 +2621,6 @@ fn toggle_sidebar(state: &State) {
             .target(&target)
             .build();
         let state_for_done = state.clone();
-        let expand_btn_for_done = expand_btn.clone();
         animation.connect_done(move |_| {
             let is_current = {
                 let mut s = state_for_done.borrow_mut();
@@ -2349,7 +2632,6 @@ fn toggle_sidebar(state: &State) {
                 }
             };
             if is_current {
-                expand_btn_for_done.set_visible(false);
                 request_session_save(&state_for_done);
             }
         });
@@ -2367,18 +2649,10 @@ fn split_pane(
     ws_id: &str,
     pane_widget: &gtk::Widget,
     orientation: gtk::Orientation,
-) {
-    split_pane_inner(state, ws_id, pane_widget, orientation, false, false);
-}
-
-fn split_pane_inner(
-    state: &State,
-    ws_id: &str,
-    pane_widget: &gtk::Widget,
-    orientation: gtk::Orientation,
+    initial_state: Option<PaneState>,
     empty: bool,
     new_pane_first: bool,
-) {
+) -> gtk::Widget {
     // Use the workspace's folder_path (or current cwd) for the new pane
     let (shortcuts, wd) = {
         let s = state.borrow();
@@ -2390,7 +2664,14 @@ fn split_pane_inner(
                 .and_then(|ws| ws.folder_path.clone().or_else(|| ws.cwd.borrow().clone())),
         )
     };
-    let new_pane = create_pane_for_workspace(state, &shortcuts, ws_id, wd.as_deref(), None, empty);
+    let new_pane = create_pane_for_workspace(
+        state,
+        &shortcuts,
+        ws_id,
+        wd.as_deref(),
+        initial_state.as_ref(),
+        empty,
+    );
 
     let parent = pane_widget.parent();
 
@@ -2450,6 +2731,7 @@ fn split_pane_inner(
         });
     }
     request_session_save(state);
+    new_pane.upcast()
 }
 
 fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
@@ -2523,7 +2805,7 @@ fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
 
 /// Find the focused pane widget (a gtk::Box with class limux-pane-toolbar child)
 /// by walking up from the currently focused widget.
-fn find_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
+fn find_leaf_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
     let (ws_id, root, stack) = {
         let s = state.borrow();
         let ws = s.active_workspace()?;
@@ -2548,12 +2830,133 @@ fn find_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
         widget = w.parent();
     }
 
+    let _ = root;
+    None
+}
+
+fn find_focused_pane(state: &State) -> Option<(String, gtk::Widget)> {
+    if let Some(found) = find_leaf_focused_pane(state) {
+        return Some(found);
+    }
+
+    let (ws_id, root) = {
+        let s = state.borrow();
+        let ws = s.active_workspace()?;
+        (ws.id.clone(), ws.root.clone())
+    };
+
     Some((ws_id, root))
+}
+
+fn focused_shortcut_target(state: &State) -> pane::FocusedShortcutTarget {
+    let Some((_ws_id, pane_widget)) = find_leaf_focused_pane(state) else {
+        return pane::FocusedShortcutTarget::None;
+    };
+    pane::focused_shortcut_target(&pane_widget)
+}
+
+fn show_runtime_error(state: &State, title: &str, detail: &str) {
+    let window = state.borrow().window.clone();
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message(title)
+        .detail(detail)
+        .build();
+    dialog.show(Some(&window));
+}
+
+fn quit_app(state: &State) {
+    save_session_now(state);
+    state.borrow().app.quit();
+}
+
+fn spawn_new_instance(state: &State) -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            let detail = format!("Failed to resolve the current Limux executable: {err}");
+            eprintln!("limux: {detail}");
+            show_runtime_error(state, "Failed to open a new Limux instance", &detail);
+            return false;
+        }
+    };
+
+    match std::process::Command::new(exe).spawn() {
+        Ok(_) => true,
+        Err(err) => {
+            let detail = format!("Failed to launch a new Limux instance: {err}");
+            eprintln!("limux: {detail}");
+            show_runtime_error(state, "Failed to open a new Limux instance", &detail);
+            false
+        }
+    }
+}
+
+fn dispatch_terminal_command(state: &State, command: ShortcutCommand) -> bool {
+    let pane::FocusedShortcutTarget::Terminal(target) = focused_shortcut_target(state) else {
+        return false;
+    };
+
+    match command {
+        ShortcutCommand::SurfaceFind => target.show_find(),
+        ShortcutCommand::SurfaceFindNext => target.find_next(),
+        ShortcutCommand::SurfaceFindPrevious => target.find_previous(),
+        ShortcutCommand::SurfaceFindHide => target.hide_find(),
+        ShortcutCommand::SurfaceUseSelectionForFind => target.use_selection_for_find(),
+        ShortcutCommand::TerminalClearScrollback => target.perform_binding_action("clear_screen"),
+        ShortcutCommand::TerminalCopy => target.perform_binding_action("copy_to_clipboard"),
+        ShortcutCommand::TerminalPaste => target.perform_binding_action("paste_from_clipboard"),
+        ShortcutCommand::TerminalIncreaseFontSize => {
+            target.perform_binding_action("increase_font_size:1")
+        }
+        ShortcutCommand::TerminalDecreaseFontSize => {
+            target.perform_binding_action("decrease_font_size:1")
+        }
+        ShortcutCommand::TerminalResetFontSize => target.perform_binding_action("reset_font_size"),
+        _ => false,
+    }
+}
+
+fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
+    let pane::FocusedShortcutTarget::Browser(target) = focused_shortcut_target(state) else {
+        return false;
+    };
+
+    match command {
+        ShortcutCommand::BrowserFocusLocation => target.focus_location(),
+        ShortcutCommand::BrowserBack => target.go_back(),
+        ShortcutCommand::BrowserForward => target.go_forward(),
+        ShortcutCommand::BrowserReload => target.reload(),
+        ShortcutCommand::BrowserInspector => target.show_inspector(),
+        ShortcutCommand::BrowserConsole => target.show_console(),
+        ShortcutCommand::SurfaceFind => target.show_find(),
+        ShortcutCommand::SurfaceFindNext => target.find_next(),
+        ShortcutCommand::SurfaceFindPrevious => target.find_previous(),
+        ShortcutCommand::SurfaceFindHide => target.hide_find(),
+        ShortcutCommand::SurfaceUseSelectionForFind => target.use_selection_for_find(),
+        ShortcutCommand::OpenBrowserInSplit => {
+            let uri = target.current_uri();
+            let Some((ws_id, pane_widget)) = find_leaf_focused_pane(state) else {
+                return false;
+            };
+            let _ = split_pane(
+                state,
+                &ws_id,
+                &pane_widget,
+                gtk::Orientation::Horizontal,
+                Some(PaneState::browser_only(uri.as_deref())),
+                false,
+                false,
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 fn split_focused_pane(state: &State, orientation: gtk::Orientation) {
     if let Some((ws_id, pane_widget)) = find_focused_pane(state) {
-        split_pane(state, &ws_id, &pane_widget, orientation);
+        let _ = split_pane(state, &ws_id, &pane_widget, orientation, None, false, false);
     }
 }
 
@@ -2721,12 +3124,17 @@ fn mark_workspace_unread(state: &State, ws_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::glib;
     use super::gtk::gdk;
     use super::{
         clamp_workspace_insert_index_for_pinning, favorites_prefix_len,
-        shortcut_command_from_key_event, sidebar_toggle_tooltip,
+        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
+        shortcut_command_from_key_event, shortcut_dispatch_propagation, sidebar_toggle_tooltip,
+        EditableCaptureContext,
     };
-    use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutCommand};
+    use crate::shortcut_config::{
+        default_shortcuts, resolve_shortcuts_from_str, EditableCapturePolicy, ShortcutCommand,
+    };
 
     #[test]
     fn favorites_prefix_len_counts_only_leading_favorites() {
@@ -2773,6 +3181,50 @@ mod tests {
             ),
             Some(ShortcutCommand::NextWorkspace)
         );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::F,
+                gdk::ModifierType::CONTROL_MASK
+            ),
+            Some(ShortcutCommand::SurfaceFind)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::Q,
+                gdk::ModifierType::CONTROL_MASK
+            ),
+            Some(ShortcutCommand::QuitApp)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::N,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK
+            ),
+            Some(ShortcutCommand::NewInstance)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(&shortcuts, gdk::Key::F11, gdk::ModifierType::empty()),
+            Some(ShortcutCommand::ToggleFullscreen)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::M,
+                gdk::ModifierType::CONTROL_MASK
+            ),
+            Some(ShortcutCommand::ToggleSidebar)
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::M,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
+            ),
+            Some(ShortcutCommand::ToggleTopBar)
+        );
     }
 
     #[test]
@@ -2789,7 +3241,7 @@ mod tests {
         assert_eq!(
             shortcut_command_from_key_event(
                 &shortcuts,
-                gdk::Key::B,
+                gdk::Key::M,
                 gdk::ModifierType::CONTROL_MASK
             ),
             None
@@ -2818,7 +3270,7 @@ mod tests {
         assert_eq!(
             shortcut_command_from_key_event(
                 &shortcuts,
-                gdk::Key::B,
+                gdk::Key::M,
                 gdk::ModifierType::CONTROL_MASK
             ),
             None
@@ -2826,15 +3278,132 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_command_from_key_event_honors_super_remaps() {
+        let shortcuts = resolve_shortcuts_from_str(
+            r#"{
+                "shortcuts": {
+                    "toggle_sidebar": "<Super>b"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            shortcut_command_from_key_event(
+                &shortcuts,
+                gdk::Key::M,
+                gdk::ModifierType::CONTROL_MASK
+            ),
+            None
+        );
+        assert_eq!(
+            shortcut_command_from_key_event(&shortcuts, gdk::Key::B, gdk::ModifierType::SUPER_MASK),
+            Some(ShortcutCommand::ToggleSidebar)
+        );
+    }
+
+    #[test]
+    fn shortcut_dispatch_propagation_stops_only_when_window_claims_shortcut() {
+        assert_eq!(shortcut_dispatch_propagation(true), glib::Propagation::Stop);
+        assert_eq!(
+            shortcut_dispatch_propagation(false),
+            glib::Propagation::Proceed
+        );
+    }
+
+    #[test]
+    fn shortcut_blocked_by_editable_only_bypasses_non_global_shortcuts() {
+        assert!(shortcut_blocked_by_editable(
+            ShortcutCommand::SurfaceFind,
+            EditableCapturePolicy::BypassInEditable,
+            EditableCaptureContext {
+                gtk_editable: true,
+                ..EditableCaptureContext::default()
+            }
+        ));
+        assert!(!shortcut_blocked_by_editable(
+            ShortcutCommand::SurfaceFind,
+            EditableCapturePolicy::AlwaysCapture,
+            EditableCaptureContext {
+                gtk_editable: true,
+                ..EditableCaptureContext::default()
+            }
+        ));
+        assert!(!shortcut_blocked_by_editable(
+            ShortcutCommand::SurfaceFind,
+            EditableCapturePolicy::BypassInEditable,
+            EditableCaptureContext::default()
+        ));
+    }
+
+    #[test]
+    fn shortcut_blocked_by_editable_blocks_dom_editable_browser_content() {
+        assert!(shortcut_blocked_by_editable(
+            ShortcutCommand::BrowserReload,
+            EditableCapturePolicy::BypassInEditable,
+            EditableCaptureContext {
+                browser_dom_editable: true,
+                ..EditableCaptureContext::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn browser_find_navigation_shortcuts_are_allowed_while_find_ui_is_active() {
+        let context = EditableCaptureContext {
+            gtk_editable: true,
+            browser_find_active: true,
+            ..EditableCaptureContext::default()
+        };
+
+        assert!(!shortcut_blocked_by_editable(
+            ShortcutCommand::SurfaceFindNext,
+            EditableCapturePolicy::BypassInEditable,
+            context
+        ));
+        assert!(!shortcut_blocked_by_editable(
+            ShortcutCommand::SurfaceFindPrevious,
+            EditableCapturePolicy::BypassInEditable,
+            context
+        ));
+        assert!(!shortcut_blocked_by_editable(
+            ShortcutCommand::SurfaceFindHide,
+            EditableCapturePolicy::BypassInEditable,
+            context
+        ));
+        assert!(shortcut_blocked_by_editable(
+            ShortcutCommand::SurfaceFind,
+            EditableCapturePolicy::BypassInEditable,
+            context
+        ));
+    }
+
+    #[test]
+    fn browser_find_active_exception_is_limited_to_navigation_shortcuts() {
+        assert!(shortcut_allowed_while_browser_find_active(
+            ShortcutCommand::SurfaceFindNext
+        ));
+        assert!(shortcut_allowed_while_browser_find_active(
+            ShortcutCommand::SurfaceFindPrevious
+        ));
+        assert!(shortcut_allowed_while_browser_find_active(
+            ShortcutCommand::SurfaceFindHide
+        ));
+        assert!(!shortcut_allowed_while_browser_find_active(
+            ShortcutCommand::SurfaceFind
+        ));
+    }
+
+    #[test]
     fn sidebar_toggle_tooltip_reflects_remaps_and_unbinds() {
         let defaults = default_shortcuts();
         assert_eq!(
             sidebar_toggle_tooltip(&defaults, true),
-            "Hide sidebar (Ctrl+B)"
+            "Hide sidebar (Ctrl+M)"
         );
         assert_eq!(
             sidebar_toggle_tooltip(&defaults, false),
-            "Show sidebar (Ctrl+B)"
+            "Show sidebar (Ctrl+M)"
         );
 
         let remapped = resolve_shortcuts_from_str(

@@ -12,9 +12,11 @@ use crate::shortcut_config::{
 enum CaptureOutcome {
     ContinueListening,
     CancelListening,
-    Capture(NormalizedShortcut),
+    CommitBinding(Option<NormalizedShortcut>),
     Error(String),
 }
+
+pub const KEYBIND_EDITOR_LISTENING_CSS: &str = "limux-keybind-editor-listening";
 
 pub const KEYBIND_EDITOR_CSS: &str = r#"
 .limux-keybind-editor {
@@ -72,19 +74,25 @@ pub const KEYBIND_EDITOR_CSS: &str = r#"
     font-size: 12px;
     margin-top: 6px;
 }
+.limux-keybind-row-hint {
+    color: rgba(255, 255, 255, 0.58);
+    font-size: 12px;
+    margin-top: 6px;
+}
 "#;
 
 #[derive(Clone)]
 struct RowWidgets {
     id: ShortcutId,
     binding_button: gtk::Button,
+    hint_label: gtk::Label,
     error_label: gtk::Label,
 }
 
 pub fn build_keybind_editor(
     shortcuts: &ResolvedShortcutConfig,
     on_capture: Rc<
-        dyn Fn(ShortcutId, NormalizedShortcut) -> Result<ResolvedShortcutConfig, String>,
+        dyn Fn(ShortcutId, Option<NormalizedShortcut>) -> Result<ResolvedShortcutConfig, String>,
     >,
 ) -> gtk::Widget {
     let state = Rc::new(RefCell::new(shortcuts.clone()));
@@ -113,7 +121,7 @@ pub fn build_keybind_editor(
 
     let hint = gtk::Label::builder()
         .label(
-            "Click a shortcut field, then press a Ctrl or Alt combo. Shift is allowed as an additional modifier.",
+            "Click a shortcut field, then press a Ctrl, Alt, or Cmd combo. Shift is allowed as an additional modifier. Press Del to unbind. Press Esc to cancel.",
         )
         .wrap(true)
         .xalign(0.0)
@@ -170,15 +178,25 @@ pub fn build_keybind_editor(
             .build();
         error_label.add_css_class("limux-keybind-error");
 
+        let hint_label = gtk::Label::builder()
+            .label("Press Del to unbind. Esc cancels.")
+            .xalign(0.0)
+            .wrap(true)
+            .visible(false)
+            .build();
+        hint_label.add_css_class("limux-keybind-row-hint");
+
         top.append(&meta);
         top.append(&binding_button);
         row.append(&top);
+        row.append(&hint_label);
         row.append(&error_label);
         rows_box.append(&row);
 
         rows.borrow_mut().push(RowWidgets {
             id: definition.id,
             binding_button: binding_button.clone(),
+            hint_label: hint_label.clone(),
             error_label: error_label.clone(),
         });
 
@@ -187,9 +205,11 @@ pub fn build_keybind_editor(
             let errors = errors.clone();
             let rows = rows.clone();
             let state = state.clone();
+            let outer = outer.clone();
             binding_button.connect_clicked(move |button| {
                 *listening.borrow_mut() = Some(shortcut_id);
                 errors.borrow_mut().remove(&shortcut_id);
+                sync_editor_listening_class(&outer, true);
                 refresh_rows(
                     &rows.borrow(),
                     &state.borrow(),
@@ -207,6 +227,7 @@ pub fn build_keybind_editor(
         let rows = rows.clone();
         let state = state.clone();
         let on_capture = on_capture.clone();
+        let outer_for_controller = outer.clone();
         let key_controller = gtk::EventControllerKey::new();
         key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         key_controller.connect_key_pressed(move |controller, keyval, keycode, modifier| {
@@ -234,21 +255,25 @@ pub fn build_keybind_editor(
                 CaptureOutcome::CancelListening => {
                     *listening.borrow_mut() = None;
                     errors.borrow_mut().remove(&shortcut_id);
+                    sync_editor_listening_class(&outer_for_controller, false);
                 }
-                CaptureOutcome::Capture(binding) => match on_capture(shortcut_id, binding) {
+                CaptureOutcome::CommitBinding(binding) => match on_capture(shortcut_id, binding) {
                     Ok(updated) => {
                         *state.borrow_mut() = updated;
                         *listening.borrow_mut() = None;
                         errors.borrow_mut().remove(&shortcut_id);
+                        sync_editor_listening_class(&outer_for_controller, false);
                     }
                     Err(err) => {
                         *listening.borrow_mut() = None;
                         errors.borrow_mut().insert(shortcut_id, err);
+                        sync_editor_listening_class(&outer_for_controller, false);
                     }
                 },
                 CaptureOutcome::Error(message) => {
                     *listening.borrow_mut() = None;
                     errors.borrow_mut().insert(shortcut_id, message);
+                    sync_editor_listening_class(&outer_for_controller, false);
                 }
             }
 
@@ -280,6 +305,14 @@ pub fn build_keybind_editor(
     outer.upcast()
 }
 
+fn sync_editor_listening_class(editor: &gtk::Box, listening: bool) {
+    if listening {
+        editor.add_css_class(KEYBIND_EDITOR_LISTENING_CSS);
+    } else {
+        editor.remove_css_class(KEYBIND_EDITOR_LISTENING_CSS);
+    }
+}
+
 fn binding_button_label(
     shortcuts: &ResolvedShortcutConfig,
     id: ShortcutId,
@@ -304,6 +337,7 @@ fn refresh_rows(
         let is_listening = listening == Some(row.id);
         row.binding_button
             .set_label(&binding_button_label(shortcuts, row.id, is_listening));
+        row.hint_label.set_visible(is_listening);
         if is_listening {
             row.binding_button
                 .add_css_class("limux-keybind-capture-listening");
@@ -341,13 +375,28 @@ fn capture_outcome_for_key_press(
         return CaptureOutcome::CancelListening;
     }
 
+    let unbind_modifiers = gtk::gdk::ModifierType::SHIFT_MASK
+        | gtk::gdk::ModifierType::CONTROL_MASK
+        | gtk::gdk::ModifierType::ALT_MASK
+        | gtk::gdk::ModifierType::META_MASK
+        | gtk::gdk::ModifierType::SUPER_MASK;
+    if matches!(keyval, gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete)
+        && !modifier.intersects(unbind_modifiers)
+    {
+        return CaptureOutcome::CommitBinding(None);
+    }
+
     let Some(binding) = NormalizedShortcut::from_gdk_key_event(display, keyval, keycode, modifier)
     else {
         return CaptureOutcome::ContinueListening;
     };
 
-    match binding.validate_host_binding(config_key) {
-        Ok(()) => CaptureOutcome::Capture(binding),
+    let Some(definition) = shortcut_config::definition_by_config_key(config_key) else {
+        return CaptureOutcome::Error("That shortcut is not valid.".to_string());
+    };
+
+    match binding.validate_host_binding(definition) {
+        Ok(()) => CaptureOutcome::CommitBinding(Some(binding)),
         Err(err) => CaptureOutcome::Error(validation_error_message(&err)),
     }
 }
@@ -355,7 +404,7 @@ fn capture_outcome_for_key_press(
 fn validation_error_message(err: &ShortcutConfigError) -> String {
     match err {
         ShortcutConfigError::BaseModifierRequired { .. } => {
-            "Use Ctrl or Alt together with another key.".to_string()
+            "Use Ctrl, Alt, or Cmd together with another key.".to_string()
         }
         ShortcutConfigError::ModifierOnlyBinding { .. } => {
             "Choose a non-modifier key for this shortcut.".to_string()
@@ -412,7 +461,7 @@ mod tests {
         };
         assert_eq!(
             validation_error_message(&err),
-            "Use Ctrl or Alt together with another key."
+            "Use Ctrl, Alt, or Cmd together with another key."
         );
     }
 
@@ -435,10 +484,34 @@ mod tests {
             gdk::ModifierType::CONTROL_MASK,
             "split_right",
         ) {
-            CaptureOutcome::Capture(binding) => {
+            CaptureOutcome::CommitBinding(Some(binding)) => {
                 assert_eq!(binding.to_display_label(), "Ctrl+0");
             }
             _ => panic!("expected capture"),
         }
+    }
+
+    #[test]
+    fn capture_outcome_supports_delete_to_unbind() {
+        assert!(matches!(
+            capture_outcome_for_key_event(
+                gdk::Key::Delete,
+                gdk::ModifierType::empty(),
+                "split_right"
+            ),
+            CaptureOutcome::CommitBinding(None)
+        ));
+    }
+
+    #[test]
+    fn capture_outcome_keeps_modified_delete_available_for_binding() {
+        assert!(matches!(
+            capture_outcome_for_key_event(
+                gdk::Key::Delete,
+                gdk::ModifierType::CONTROL_MASK,
+                "split_right"
+            ),
+            CaptureOutcome::CommitBinding(Some(_))
+        ));
     }
 }
